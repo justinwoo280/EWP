@@ -56,21 +56,19 @@ QJsonArray ConfigGenerator::generateInbounds(const EWPNode &node,
     QJsonArray arr;
     QJsonObject in;
     if (tunMode) {
-        in["tag"]     = "tun-in";
-        in["type"]    = "tun";
-        // v2 cfg.TUNCfg yaml schema:
-        //   address       — CIDR string, REQUIRED
-        //   dns           — list of strings (v4 + v6 mixed)
-        //   mtu           — int
-        //   fake_ip       — bool (omit, defaults to true on TUN)
-        //   bypass_server — host[:port] of upstream, STRONGLY recommended
-        in["address"] = settings.tunIP;          // e.g. "10.233.0.2/24"
+        in["tag"]  = "tun-in";
+        in["type"] = "tun";
+        // v2 cfg.InboundCfg nests TUN-specific settings under a
+        // 'tun:' sub-object — flat layout makes the loader reject
+        // with 'tun.address is required' even when address is set.
+        QJsonObject tun;
+        tun["address"] = settings.tunIP;          // e.g. "10.233.0.2/24"
         QJsonArray dns;
         if (!settings.tunnelDNS.isEmpty())   dns.append(settings.tunnelDNS);
         if (!settings.tunnelDNSv6.isEmpty()) dns.append(settings.tunnelDNSv6);
-        if (!dns.isEmpty()) in["dns"] = dns;
-        in["mtu"]      = settings.tunMTU;
-        in["fake_ip"]  = true;
+        if (!dns.isEmpty()) tun["dns"] = dns;
+        tun["mtu"]      = settings.tunMTU;
+        tun["fake_ip"]  = true;
         // bypass_server: derived from the chosen node so the TUN
         // setup probe knows which physical interface to mark for
         // outbound traffic before installing its default route.
@@ -79,8 +77,9 @@ QJsonArray ConfigGenerator::generateInbounds(const EWPNode &node,
         if (!node.server.isEmpty()) {
             QString bs = node.server;
             if (node.serverPort > 0) bs += ":" + QString::number(node.serverPort);
-            in["bypass_server"] = bs;
+            tun["bypass_server"] = bs;
         }
+        in["tun"] = tun;
     } else {
         in["tag"]    = "local-socks";
         in["type"]   = "socks5";
