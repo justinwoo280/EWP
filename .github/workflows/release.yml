@@ -106,10 +106,96 @@ jobs:
           if-no-files-found: error
 
   # ----------------------------------------------------------------
-  # Qt6 GUI (linux only).
+  # GUI bundles. Each one is a self-contained zip / tar:
+  #   * EWP-GUI (Qt6 binary)
+  #   * the cmd/ewp kernel (built right here so versions match)
+  #   * Qt6 runtime DLLs / SOs gathered by windeployqt / linuxdeployqt
+  #   * wintun.dll (Windows only — required for TUN mode)
+  #   * a tiny README pointing at the wiki
   # ----------------------------------------------------------------
-  ewp-gui:
-    name: GUI (linux)
+  ewp-gui-windows:
+    name: GUI bundle (windows-amd64)
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+          cache: true
+          cache-dependency-path: ewp-core/go.sum
+
+      - name: Build cmd/ewp.exe
+        shell: bash
+        env: { CGO_ENABLED: '0' }
+        run: |
+          cd ewp-core
+          go build -trimpath \
+            -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" \
+            -o ../ewp.exe ./cmd/ewp
+
+      - name: Install Qt6 (msvc 2022)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.0'
+          host:    'windows'
+          target:  'desktop'
+          arch:    'win64_msvc2019_64'
+          modules: 'qtwebsockets'
+
+      - name: Configure & build GUI
+        shell: cmd
+        run: |
+          cmake -S ewp-gui -B ewp-gui\build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake --build ewp-gui\build --config Release
+
+      - name: Stage bundle
+        shell: bash
+        run: |
+          PKG=ewp-gui-${{ github.event.inputs.version }}-windows-amd64
+          mkdir -p "$PKG"
+          cp ewp-gui/build/EWP-GUI.exe       "$PKG/"
+          cp ewp.exe                          "$PKG/"
+          cp ewp-core/wintun.dll              "$PKG/"
+          # Have windeployqt collect every Qt6 dependency the EXE
+          # actually opens — much smaller than copying the whole
+          # Qt6 prefix and immune to module-list churn.
+          windeployqt --release --no-translations --no-system-d3d-compiler "$PKG/EWP-GUI.exe"
+          # README inside the bundle so end-users have a clue.
+          cat > "$PKG/README.txt" <<EOF
+          EWP — Windows desktop bundle ${{ github.event.inputs.version }}
+
+          1. Double-click EWP-GUI.exe to launch.
+          2. The GUI auto-spawns ewp.exe in the same folder.
+          3. TUN mode requires Administrator (wintun.dll backs it).
+
+          Files in this bundle:
+            EWP-GUI.exe       Qt6 desktop frontend
+            ewp.exe           cmd/ewp kernel (single binary, runtime configured)
+            wintun.dll        Wireguard wintun driver, required for TUN mode
+            Qt6*.dll          Qt6 runtime
+            platforms/        Qt6 platform plug-ins (qwindows.dll)
+            *.dll             other Qt6 module DLLs
+
+          Documentation: https://github.com/justinwoo280/EWP
+          EOF
+
+          7z a -mx=9 "$PKG.zip" "$PKG"
+          sha256sum "$PKG.zip" > "$PKG.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ewp-gui-windows
+          path: |
+            ewp-gui-${{ github.event.inputs.version }}-windows-amd64.zip
+            ewp-gui-${{ github.event.inputs.version }}-windows-amd64.zip.sha256
+          if-no-files-found: error
+
+  ewp-gui-linux:
+    name: GUI bundle (linux-amd64)
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -117,24 +203,60 @@ jobs:
         with:
           ref: ${{ github.event.inputs.version }}
 
-      - name: Install Qt6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+          cache: true
+          cache-dependency-path: ewp-core/go.sum
+
+      - name: Build cmd/ewp
+        env: { CGO_ENABLED: '0' }
+        run: |
+          cd ewp-core
+          go build -trimpath \
+            -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" \
+            -o ../ewp ./cmd/ewp
+
+      - name: Install Qt6 + Ninja
         run: |
           sudo apt-get update -qq
           sudo apt-get install -qq -y --no-install-recommends qt6-base-dev ninja-build
 
-      - run: cmake -S ewp-gui -B ewp-gui/build -G Ninja
-      - run: ninja -C ewp-gui/build
-      - run: |
-          mv ewp-gui/build/EWP-GUI ewp-gui-${{ github.event.inputs.version }}-linux-amd64
-          sha256sum ewp-gui-${{ github.event.inputs.version }}-linux-amd64 \
-            > ewp-gui-${{ github.event.inputs.version }}-linux-amd64.sha256
+      - name: Build GUI
+        run: |
+          cmake -S ewp-gui -B ewp-gui/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja -C ewp-gui/build
+
+      - name: Stage bundle
+        run: |
+          PKG=ewp-gui-${{ github.event.inputs.version }}-linux-amd64
+          mkdir -p "$PKG"
+          cp ewp-gui/build/EWP-GUI "$PKG/"
+          cp ewp                    "$PKG/"
+          # Linux Qt6 lives in distro packages — we don't bundle the
+          # runtime; users install qt6-base via apt/dnf/pacman. (For
+          # AppImage builds, swap this for linuxdeployqt.)
+          cat > "$PKG/README.txt" <<'EOF'
+          EWP — Linux desktop bundle.
+
+          1. Install Qt6 runtime: e.g. `sudo apt install qt6-base`
+             on Debian/Ubuntu, `qt6-base` on Arch.
+          2. Run ./EWP-GUI from this directory.
+          3. TUN mode needs root (CAP_NET_ADMIN). Either use sudo
+             or `setcap cap_net_admin+ep ./ewp` once.
+
+          Files: EWP-GUI (Qt6 frontend), ewp (kernel binary).
+          Documentation: https://github.com/justinwoo280/EWP
+          EOF
+          tar czf "$PKG.tar.gz" "$PKG"
+          sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ewp-gui-linux
           path: |
-            ewp-gui-${{ github.event.inputs.version }}-linux-amd64
-            ewp-gui-${{ github.event.inputs.version }}-linux-amd64.sha256
+            ewp-gui-${{ github.event.inputs.version }}-linux-amd64.tar.gz
+            ewp-gui-${{ github.event.inputs.version }}-linux-amd64.tar.gz.sha256
           if-no-files-found: error
 
   # ----------------------------------------------------------------
@@ -206,7 +328,7 @@ jobs:
   # ----------------------------------------------------------------
   release:
     name: Publish GitHub release
-    needs: [ ewp-binary, ewp-gui, android ]
+    needs: [ ewp-binary, ewp-gui-windows, ewp-gui-linux, android ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

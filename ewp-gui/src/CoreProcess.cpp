@@ -40,20 +40,29 @@ QString CoreProcess::findCoreExecutable()
 
 #ifdef Q_OS_WIN
     QStringList candidates = {
+        // v2 binary is called "ewp.exe" (single binary, runtime
+        // configured). Old "ewp-core(-client).exe" names are kept
+        // here only as a fallback when an end-user upgrades the
+        // GUI but forgets to replace the old kernel — they get a
+        // best-effort attempt to keep working until they do.
+        appDir + "/ewp.exe",
         appDir + "/ewp-core.exe",
         appDir + "/ewp-core-client.exe",
+        appDir + "/../ewp.exe",
         appDir + "/../ewp-core.exe",
         appDir + "/../ewp-core-client.exe",
     };
-    QString fallback = "ewp-core.exe";
+    QString fallback = "ewp.exe";
 #else
     QStringList candidates = {
+        appDir + "/ewp",
         appDir + "/ewp-core",
         appDir + "/ewp-core-client",
+        appDir + "/../ewp",
         appDir + "/../ewp-core",
         appDir + "/../ewp-core-client",
     };
-    QString fallback = "ewp-core";
+    QString fallback = "ewp";
 #endif
 
     for (const QString &path : candidates) {
