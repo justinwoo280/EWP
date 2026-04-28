@@ -1,3 +1,12 @@
+//go:build linux || android || darwin || freebsd
+
+// NewWithFD attaches a gVisor-stacked TUN to an OS-supplied file
+// descriptor — the typical use case is Android's VpnService.establish(),
+// but the same path works for Linux desktop apps that received a tun
+// fd over a unix socket. Windows uses the wintun handle API instead
+// and so this file is excluded there: wgtun.CreateTUNFromFile is a
+// no-op stub on Windows that fails to link, hence the build tag.
+
 package tun
 
 import (
