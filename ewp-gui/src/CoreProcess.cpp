@@ -112,7 +112,11 @@ bool CoreProcess::startCore(const EWPNode &node, bool tunMode)
     }
     
     QStringList args;
-    args << "-c" << configFilePath;
+    // v2 cmd/ewp uses Go's standard flag package which only accepts the
+    // long form '-config'; v1 cmd/client also took the short '-c' alias
+    // but that's gone now. If you ever need to support both, add an
+    // alias on the cmd/ewp side, not here.
+    args << "-config" << configFilePath;
 
 #ifdef Q_OS_WIN
     if (tunMode && !IsUserAnAdmin()) {
