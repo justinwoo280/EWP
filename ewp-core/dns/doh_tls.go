@@ -34,7 +34,13 @@ func dohTLSConfig(serverName string) *tls.Config {
 		ServerName: serverName,
 		RootCAs:    cabundle.MozillaPool(),
 		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
+		// ALPN MUST stay h2-only. Adding "http/1.1" as a fallback
+		// causes 223.5.5.5 (AliDNS) to RST the connection — confirmed
+		// from a wireshark capture diff: ALPN len=14 (h2+http/1.1)
+		// gets RST/FIN, ALPN len=5 (h2-only) succeeds. Some hardened
+		// CDN/DoH frontends key on the exact ALPN list shape; don't
+		// touch this without retesting from a CN egress.
+		NextProtos: []string{"h2"},
 		CurvePreferences: []tls.CurveID{
 			tls.X25519MLKEM768,
 			tls.X25519,
