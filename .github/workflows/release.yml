@@ -144,12 +144,24 @@ jobs:
           host:    'windows'
           target:  'desktop'
           arch:    'win64_msvc2019_64'
-          modules: 'qtwebsockets'
+
+      # GitHub's windows-latest image ships MinGW first in PATH, but
+      # the Qt 6.7 prefix above is built against MSVC ABI — linking
+      # MinGW objects against MSVC libs ends in '_Float16 multiple
+      # definition' errors. Set up MSVC's environment so cmake picks
+      # cl.exe + link.exe and the toolchain matches.
+      - name: Setup MSVC env
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Configure & build GUI
         shell: cmd
         run: |
-          cmake -S ewp-gui -B ewp-gui\build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+          cmake -S ewp-gui -B ewp-gui\build -G "Ninja" ^
+                -DCMAKE_BUILD_TYPE=Release ^
+                -DCMAKE_C_COMPILER=cl ^
+                -DCMAKE_CXX_COMPILER=cl
           cmake --build ewp-gui\build --config Release
 
       - name: Stage bundle
