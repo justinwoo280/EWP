@@ -1,0 +1,53 @@
+# Reverse-tunnel server: plaintext EWP-over-WebSocket on 127.0.0.1.
+#
+# Use this when the v2 server runs *behind* an outer tunnel that
+# already terminates TLS for you — frp, cloudflared, ngrok, tailscale
+# funnel, etc. The outer hop publishes wss://your-public-name to the
+# internet, decrypts at its edge, and forwards plaintext WS to this
+# EWP server on loopback.
+#
+# Tradeoffs:
+#   + No certificate management on this box.
+#   + Works behind NAT / from a residential IP / on networks where
+#     port 443 is blocked from inbound.
+#   + The outer tunnel sees only TLS+WS — the EWP-layer AEAD plus
+#     the (optional, client-side) ECH still defend the actual data,
+#     so an evil tunnel operator cannot read traffic.
+#   - You trust the outer tunnel to terminate TLS honestly. Pick a
+#     reputable provider; for serious threat models prefer the normal
+#     server.yaml with your own cert.
+#
+# Run on the box that hosts the EWP exit:
+#   ewp -config server-reverse.yaml
+# Then point the outer tunnel at 127.0.0.1:8080.
+
+inbounds:
+  - tag: ewp-in
+    type: ewpserver
+    uuids:
+      - "01020304-0506-0708-090a-0b0c0d0e0f10"
+    transport:
+      kind: websocket
+      url: "127.0.0.1:8080"           # plaintext, loopback only
+      path: "/ewp"
+      # No cert / key — buildServerTLSConfig returns nil and the
+      # listener falls back to net.Listen + srv.Serve.
+
+outbounds:
+  - tag: out
+    type: direct
+
+router:
+  default: out
+
+dns:
+  server:
+    upstream:
+      servers:
+        - "https://1.1.1.1/dns-query"
+        - "https://dns.google/dns-query"
+      cache_size: 16384
+      worker_pool: 16
+
+# stun: optional, but normally still useful so PROBE_RESP returns
+# a meaningful reflexive address. Skip if you don't care.

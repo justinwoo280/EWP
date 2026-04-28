@@ -108,7 +108,7 @@ func buildClientTransport(c TransportCfg, echBootstrap []string, resolver *clien
 	if c.URL == "" {
 		return nil, errors.New("transport.url is required")
 	}
-	addr, path, err := splitURL(c.URL)
+	addr, path, isTLS, err := splitURL(c.URL)
 	if err != nil {
 		return nil, fmt.Errorf("url: %w", err)
 	}
@@ -158,7 +158,18 @@ func buildClientTransport(c TransportCfg, echBootstrap []string, resolver *clien
 
 	switch c.Kind {
 	case "ws", "websocket":
-		t := websocket.New(addr, path, c.ECH, useMozillaCA, enablePQC, echMgr)
+		// Plain WS only when scheme says ws:// AND ECH wasn't asked for.
+		// (ECH on a non-TLS leg is a contradiction; refuse rather than
+		//  silently downgrade.)
+		var t *websocket.Transport
+		if !isTLS {
+			if c.ECH {
+				return nil, errors.New("transport.ech requires wss:// or https:// — got plain scheme")
+			}
+			t = websocket.NewPlain(addr, path)
+		} else {
+			t = websocket.New(addr, path, c.ECH, useMozillaCA, enablePQC, echMgr)
+		}
 		if c.Host != "" {
 			t.SetHost(c.Host)
 		}
@@ -212,23 +223,35 @@ func buildClientTransport(c TransportCfg, echBootstrap []string, resolver *clien
 }
 
 // splitURL turns "wss://host:443/some/path" into ("host:443",
-// "/some/path"). Schemes are accepted but discarded — the transport
-// implementations always go over TLS in v2.
-func splitURL(raw string) (addr, path string, err error) {
+// "/some/path", true). The bool reports whether the scheme implies
+// TLS — currently only `ws://` and `http://` opt OUT (used for
+// reverse-tunnel deployments where TLS is terminated by an outer
+// hop like frp / cloudflared / ngrok).
+func splitURL(raw string) (addr, path string, isTLS bool, err error) {
 	u, err := neturl.Parse(raw)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	if u.Host == "" {
-		return "", "", errors.New("missing host")
+		return "", "", false, errors.New("missing host")
 	}
 	addr = u.Host
-	// Default ports per scheme.
-	if _, _, e := net.SplitHostPort(addr); e != nil {
-		switch u.Scheme {
-		case "ws", "http":
+	scheme := u.Scheme
+	// Default port + tls determination per scheme.
+	switch scheme {
+	case "ws", "http":
+		isTLS = false
+		if _, _, e := net.SplitHostPort(addr); e != nil {
 			addr = net.JoinHostPort(addr, "80")
-		case "wss", "https", "h3", "h3grpc", "":
+		}
+	case "wss", "https", "h3", "h3grpc", "":
+		isTLS = true
+		if _, _, e := net.SplitHostPort(addr); e != nil {
+			addr = net.JoinHostPort(addr, "443")
+		}
+	default:
+		isTLS = true
+		if _, _, e := net.SplitHostPort(addr); e != nil {
 			addr = net.JoinHostPort(addr, "443")
 		}
 	}
@@ -236,7 +259,7 @@ func splitURL(raw string) (addr, path string, err error) {
 	if path == "" {
 		path = "/"
 	}
-	return addr, path, nil
+	return addr, path, isTLS, nil
 }
 
 // addrHost strips the port off "host:port" for SNI/ECH purposes.

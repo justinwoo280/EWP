@@ -40,6 +40,8 @@ type Transport struct {
 	mu        sync.Mutex
 	bypassCfg *transport.BypassConfig
 	resolver  *clientdns.Resolver
+
+	useTLS bool // false = plaintext WS for reverse-tunnel deployments
 }
 
 // SetClientResolver wires the privacy-preserving DoH resolver used to
@@ -51,7 +53,9 @@ func (t *Transport) SetClientResolver(r *clientdns.Resolver) {
 	t.mu.Unlock()
 }
 
-// New constructs a v2 WebSocket transport.
+// New constructs a v2 WebSocket transport using TLS (the standard
+// internet-facing case). For plaintext (reverse-tunnel) deployments
+// use NewPlain.
 //
 // serverAddr: "host:port" for the upstream TLS listener.
 // path: HTTP path on the listener (e.g. "/ewp").
@@ -71,6 +75,22 @@ func New(serverAddr, path string, useECH, useMozillaCA, enablePQC bool, echManag
 		useMozillaCA: useMozillaCA,
 		enablePQC:    enablePQC,
 		echManager:   echManager,
+		useTLS:       true,
+	}
+}
+
+// NewPlain constructs a plaintext WebSocket transport. Only valid
+// when the EWP server runs behind a reverse-tunnel (frp / cloudflared
+// / ngrok / tailscale-funnel) that already terminates TLS at its
+// edge. The application-layer EWP AEAD still defends the data.
+func NewPlain(serverAddr, path string) *Transport {
+	if path == "" {
+		path = "/"
+	}
+	return &Transport{
+		serverAddr: serverAddr,
+		path:       path,
+		useTLS:     false,
 	}
 }
 
@@ -105,40 +125,10 @@ func (t *Transport) Dial() (transport.TunnelConn, error) {
 		return nil, fmt.Errorf("ws: bad serverAddr %q: %w", t.serverAddr, err)
 	}
 
-	sni := t.sni
-	if sni == "" {
-		sni = host
-	}
-
-	cfg, err := commontls.NewSTDConfig(sni, t.useMozillaCA, t.enablePQC)
-	if err != nil {
-		return nil, fmt.Errorf("ws: tls cfg: %w", err)
-	}
-	tlsCfg, err := cfg.TLSConfig()
-	if err != nil {
-		return nil, err
-	}
-	tlsCfg.NextProtos = []string{"http/1.1"}
-	if t.useECH && t.echManager != nil {
-		echList, err := t.echManager.Get()
-		if err != nil {
-			return nil, fmt.Errorf("ws: ech fetch: %w", err)
-		}
-		tlsCfg.EncryptedClientHelloConfigList = echList
-		tlsCfg.EncryptedClientHelloRejectionVerify = func(cs tls.ConnectionState) error {
-			return errors.New("server rejected ECH")
-		}
-	}
-
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
 	if bp := t.bypass(); bp != nil && bp.TCPDialer != nil {
 		dialer = bp.TCPDialer
 	}
-
-	// Resolve server domain via the privacy-preserving DoH resolver
-	// if one was configured; otherwise the OS resolver does the
-	// heavy lifting (and leaks the domain to the local ISP, which
-	// is exactly what the user opted out of by setting client_dns).
 	dialAddr := net.JoinHostPort(host, port)
 	t.mu.Lock()
 	resolver := t.resolver
@@ -150,33 +140,80 @@ func (t *Transport) Dial() (transport.TunnelConn, error) {
 		}
 		dialAddr = resolved
 	}
-	rawConn, err := dialer.DialContext(context.Background(), "tcp", dialAddr)
-	if err != nil {
-		return nil, fmt.Errorf("ws: tcp dial: %w", err)
-	}
-	tlsConn := tls.Client(rawConn, tlsCfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
-		_ = rawConn.Close()
-		return nil, fmt.Errorf("ws: tls handshake: %w", err)
-	}
-	log.V("[ws] TLS established (%s)", commontls.GetConnectionInfo(tlsConn.ConnectionState()))
 
 	httpHost := t.host
 	if httpHost == "" {
 		httpHost = host
 	}
-
-	target := url.URL{Scheme: "wss", Host: net.JoinHostPort(httpHost, port), Path: t.path}
 	header := http.Header{}
 	header.Set("Host", httpHost)
 
-	conn := newConn()
+	// Two dial paths depending on useTLS:
+	//   useTLS == true  : dial TCP, do TLS-1.3 handshake (with optional
+	//                     ECH), then upgrade WS over the *tls.Conn
+	//   useTLS == false : dial TCP, upgrade WS directly over the raw
+	//                     conn — for reverse-tunnel deployments where
+	//                     TLS is terminated by the outer hop. The EWP
+	//                     application-layer AEAD still defends data.
+	var (
+		conn   = newConn()
+		netCon net.Conn
+	)
+	if t.useTLS {
+		sni := t.sni
+		if sni == "" {
+			sni = host
+		}
+		cfg, err := commontls.NewSTDConfig(sni, t.useMozillaCA, t.enablePQC)
+		if err != nil {
+			return nil, fmt.Errorf("ws: tls cfg: %w", err)
+		}
+		tlsCfg, err := cfg.TLSConfig()
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg.NextProtos = []string{"http/1.1"}
+		if t.useECH && t.echManager != nil {
+			echList, err := t.echManager.Get()
+			if err != nil {
+				return nil, fmt.Errorf("ws: ech fetch: %w", err)
+			}
+			tlsCfg.EncryptedClientHelloConfigList = echList
+			tlsCfg.EncryptedClientHelloRejectionVerify = func(cs tls.ConnectionState) error {
+				return errors.New("server rejected ECH")
+			}
+		}
+		raw, err := dialer.DialContext(context.Background(), "tcp", dialAddr)
+		if err != nil {
+			return nil, fmt.Errorf("ws: tcp dial: %w", err)
+		}
+		tc := tls.Client(raw, tlsCfg)
+		if err := tc.HandshakeContext(context.Background()); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("ws: tls handshake: %w", err)
+		}
+		log.V("[ws] TLS established (%s)", commontls.GetConnectionInfo(tc.ConnectionState()))
+		netCon = tc
+	} else {
+		raw, err := dialer.DialContext(context.Background(), "tcp", dialAddr)
+		if err != nil {
+			return nil, fmt.Errorf("ws: tcp dial: %w", err)
+		}
+		log.V("[ws] plaintext WS to %s (TLS terminated by outer tunnel)", dialAddr)
+		netCon = raw
+	}
+
+	scheme := "wss"
+	if !t.useTLS {
+		scheme = "ws"
+	}
+	target := url.URL{Scheme: scheme, Host: net.JoinHostPort(httpHost, port), Path: t.path}
 	socket, _, err := gws.NewClientFromConn(conn, &gws.ClientOption{
 		Addr:          target.String(),
 		RequestHeader: header,
-	}, tlsConn)
+	}, netCon)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = netCon.Close()
 		return nil, fmt.Errorf("ws: upgrade: %w", err)
 	}
 	conn.attach(socket)

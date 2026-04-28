@@ -1,0 +1,45 @@
+# Reverse-tunnel client: connect to an EWP server that's exposed
+# through frp / cloudflared / ngrok / tailscale-funnel.
+#
+# Pair with examples/server-reverse.yaml. The outer hop terminates
+# TLS at its public name; the EWP server runs plaintext WS on
+# loopback. The wire-side picture from this client is:
+#
+#   [this client] -- TLS to public-name --> [outer hop] -- plain WS --> [ewp server]
+#
+# We mark transport.url with `ws://` (not wss) only when our local
+# loopback connects DIRECTLY to a plain server. In the typical
+# reverse-tunnel layout you want `wss://` here because the OUTER
+# hop is what we talk to, and that hop terminates TLS for us.
+#
+# This example shows the rare case where you ARE the outer hop
+# operator and have a private channel to the EWP server (e.g. a
+# wireguard tunnel between this client box and the server box).
+
+inbounds:
+  - tag: local-socks
+    type: socks5
+    listen: "127.0.0.1:1080"
+
+outbounds:
+  - tag: my-vps
+    type: ewpclient
+    uuid: "01020304-0506-0708-090a-0b0c0d0e0f10"
+    transport:
+      kind: websocket
+      # ws:// scheme triggers plaintext mode. ech: must NOT be set
+      # (it's a TLS feature; cmd/ewp/cfg refuses the combination).
+      url: "ws://10.0.0.5:8080/ewp"
+      # No sni, no ech, no ech_domain — TLS-only fields. ECH
+      # protection still applies for ANY TLS hop further upstream.
+
+router:
+  default: my-vps
+
+# server_name_dns is still useful here — it resolves "10.0.0.5" via
+# DoH if you wrote a DNS name there, even when the TLS layer is
+# absent. For raw-IP urls like above it has nothing to do.
+client:
+  doh:
+    servers:
+      - "https://1.1.1.1/dns-query"

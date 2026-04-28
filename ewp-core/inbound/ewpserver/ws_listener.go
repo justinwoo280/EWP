@@ -24,15 +24,23 @@ import (
 type WSListener struct {
 	listen string
 	path   string
-	tlsCfg *tls.Config // nil = plaintext WS (testing only)
+	tlsCfg *tls.Config // nil = plaintext WS — legitimate for tests
+	                   // AND for reverse-tunnel deployments where a
+	                   // local 127.0.0.1:80 EWP server is exposed
+	                   // outward through frp / ngrok / cloudflared /
+	                   // tailscale, with TLS terminated at the
+	                   // tunneling layer rather than here.
 
 	mu     sync.Mutex
 	server *http.Server
 	closed bool
 }
 
-// NewWSListener creates a TLS WebSocket listener for the given path.
-// Pass tlsCfg=nil only for in-process tests.
+// NewWSListener creates a WebSocket listener for the given path.
+// Pass a non-nil tlsCfg for direct-internet deployments. Pass nil
+// for either (a) in-process tests or (b) reverse-tunnel layouts
+// where TLS is terminated by the outer hop (frp / cloudflared /
+// ngrok / tailscale-funnel).
 func NewWSListener(listen, path string, tlsCfg *tls.Config) *WSListener {
 	if path == "" {
 		path = "/"
