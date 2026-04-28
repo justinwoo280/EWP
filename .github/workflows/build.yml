@@ -1,4 +1,4 @@
-name: Build EWP-Workers
+name: Build EWP
 
 on:
   push:
@@ -8,49 +8,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-core-client:
-    name: Build Client (${{ matrix.goos }}/${{ matrix.goarch }})
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ewp-core
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { goos: windows, goarch: amd64, suffix: .exe }
-          - { goos: windows, goarch: arm64, suffix: .exe }
-          - { goos: linux,   goarch: amd64, suffix: ""   }
-          - { goos: linux,   goarch: arm64, suffix: ""   }
-          - { goos: darwin,  goarch: amd64, suffix: ""   }
-          - { goos: darwin,  goarch: arm64, suffix: ""   }
-          - { goos: freebsd, goarch: amd64, suffix: ""   }
-          - { goos: freebsd, goarch: arm64, suffix: ""   }
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.6'
-          cache: true
-
-      - name: Build
-        run: |
-          cd cmd/client
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w" \
-            -o ../../ewp-core-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} .
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: client-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ewp-core/ewp-core-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
-
-  build-core-server:
-    name: Build Server (${{ matrix.goos }}/${{ matrix.goarch }})
+  # ------------------------------------------------------------------
+  # core: go test + build the unified cmd/ewp binary across our matrix.
+  # In v2 there is exactly ONE binary (cmd/ewp), runtime-configured to
+  # behave as client / server / relay via YAML — no per-role builds.
+  # ------------------------------------------------------------------
+  core:
+    name: Core ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -61,12 +25,11 @@ jobs:
         include:
           - { goos: linux,   goarch: amd64, suffix: ""   }
           - { goos: linux,   goarch: arm64, suffix: ""   }
-          - { goos: windows, goarch: amd64, suffix: .exe }
-          - { goos: windows, goarch: arm64, suffix: .exe }
           - { goos: darwin,  goarch: amd64, suffix: ""   }
           - { goos: darwin,  goarch: arm64, suffix: ""   }
+          - { goos: windows, goarch: amd64, suffix: .exe }
+          - { goos: windows, goarch: arm64, suffix: .exe }
           - { goos: freebsd, goarch: amd64, suffix: ""   }
-          - { goos: freebsd, goarch: arm64, suffix: ""   }
 
     steps:
       - uses: actions/checkout@v4
@@ -76,143 +39,113 @@ jobs:
         with:
           go-version: '1.25.6'
           cache: true
+          cache-dependency-path: ewp-core/go.sum
+
+      # Tests run only once on linux/amd64 — protocol-level tests are
+      # pure Go with no OS-specific paths, so re-running them on every
+      # cross-build target wastes CI minutes.
+      - name: go test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go test ./... -count=1 -timeout 120s
+
+      - name: go vet
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go vet ./...
+
+      - name: Build cmd/ewp
+        env:
+          GOOS:   ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o ../ewp-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} \
+            ./cmd/ewp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ewp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ewp-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # gui: Qt6 desktop build (linux only — we don't ship Win/Mac GUI
+  # binaries from CI; users build locally with their own Qt install).
+  # ------------------------------------------------------------------
+  gui:
+    name: GUI (Qt6 / linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6 + Ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends \
+            qt6-base-dev ninja-build
+
+      - name: Configure
+        run: cmake -S ewp-gui -B ewp-gui/build -G Ninja
 
       - name: Build
-        run: |
-          cd cmd/server
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w" \
-            -o ../../ewp-core-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} .
+        run: ninja -C ewp-gui/build
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: server-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ewp-core/ewp-core-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          name: ewp-gui-linux
+          path: ewp-gui/build/EWP-GUI
+          if-no-files-found: error
 
-  build-gui-windows:
-    name: Build EWP-GUI (Windows)
-    needs: build-core-client
-    runs-on: windows-latest
-
+  # ------------------------------------------------------------------
+  # mobile-aar: gomobile bind, feeds ewp-android (built separately in
+  # build-android-apk.yml). Pulled out so the apk job can short-circuit
+  # if the aar didn't change.
+  # ------------------------------------------------------------------
+  mobile-aar:
+    name: Android AAR (gomobile)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Core Client - Windows amd64
-        uses: actions/download-artifact@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          name: client-windows-amd64
-          path: ./core-binaries
-
-      - name: Install Qt6
-        uses: jurplel/install-qt-action@v3
-        with:
-          version: '6.6.*'
-          host: 'windows'
-          target: 'desktop'
-          arch: 'win64_msvc2019_64'
+          go-version: '1.25.6'
           cache: true
+          cache-dependency-path: ewp-core/go.sum
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
 
-      - name: Build GUI - Windows x64
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: Install gomobile
         run: |
-          cd ewp-gui
-          mkdir build-x64
-          cd build-x64
-          cmake .. -DCMAKE_BUILD_TYPE=Release -G "NMake Makefiles"
-          nmake
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
 
-      - name: Deploy Qt Dependencies
+      - name: Build aar
+        working-directory: ewp-core
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cd ewp-gui\build-x64
-          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw EWP-GUI.exe
+          gomobile bind -target=android -androidapi=21 \
+            -ldflags="-s -w" \
+            -o ../ewp-core.aar ./ewpmobile
 
-      - name: Package GUI with Core - Windows x64
-        run: |
-          mkdir ewp-gui-windows-amd64
-          xcopy /E /I ewp-gui\build-x64 ewp-gui-windows-amd64
-          copy core-binaries\ewp-core-client-windows-amd64.exe ewp-gui-windows-amd64\ewp-core.exe
-          copy ewp-core\wintun.dll ewp-gui-windows-amd64\
-
-      - name: Upload GUI Windows Artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ewp-gui-windows-binaries
-          path: ewp-gui-windows-amd64/
-
-  build-gui-linux:
-    name: Build EWP-GUI (Linux)
-    needs: build-core-client
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Core Client - Linux amd64
-        uses: actions/download-artifact@v4
-        with:
-          name: client-linux-amd64
-          path: ./core-binaries
-
-      - name: Install Qt6
-        uses: jurplel/install-qt-action@v3
-        with:
-          version: '6.6.*'
-          host: 'linux'
-          target: 'desktop'
-          cache: true
-
-      - name: Build GUI - Linux x64
-        run: |
-          cd ewp-gui
-          mkdir build
-          cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Package GUI with Core - Linux x64
-        run: |
-          mkdir -p ewp-gui-linux-amd64/lib
-
-          cp ewp-gui/build/EWP-GUI ewp-gui-linux-amd64/
-          cp core-binaries/ewp-core-client-linux-amd64 ewp-gui-linux-amd64/ewp-core
-
-          ldd ewp-gui/build/EWP-GUI | grep Qt | awk '{print $3}' | xargs -I {} cp {} ewp-gui-linux-amd64/lib/
-
-          mkdir -p ewp-gui-linux-amd64/plugins/platforms
-          cp -r $Qt6_DIR/plugins/platforms/libqxcb.so ewp-gui-linux-amd64/plugins/platforms/ || true
-
-          cat > ewp-gui-linux-amd64/EWP-GUI.sh << 'EOF'
-          #!/bin/bash
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
-          export QT_PLUGIN_PATH="$DIR/plugins"
-          exec "$DIR/EWP-GUI" "$@"
-          EOF
-
-          chmod +x ewp-gui-linux-amd64/EWP-GUI
-          chmod +x ewp-gui-linux-amd64/EWP-GUI.sh
-          chmod +x ewp-gui-linux-amd64/ewp-core
-
-      - name: Upload GUI Linux Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ewp-gui-linux-binaries
-          path: ewp-gui-linux-amd64/
-
-  summary:
-    name: Build Summary
-    needs: [build-core-client, build-core-server, build-gui-windows, build-gui-linux]
-    runs-on: ubuntu-latest
-    if: always()
-
-    steps:
-      - name: Check Build Status
-        run: |
-          echo "=== Build Summary ==="
-          echo "Core Client: ${{ needs.build-core-client.result }}"
-          echo "Core Server: ${{ needs.build-core-server.result }}"
-          echo "GUI Windows: ${{ needs.build-gui-windows.result }}"
-          echo "GUI Linux:   ${{ needs.build-gui-linux.result }}"
+          name: ewp-core-aar
+          path: ewp-core.aar
+          if-no-files-found: error

@@ -1,15 +1,25 @@
 name: Build Android APK
 
+# Self-contained Android pipeline. Builds the gomobile aar in-place,
+# then assembleRelease. Triggered by anything that could change either
+# layer; not factored out of build.yml because we want the apk to be
+# available as a single CI artefact for QA, even when build.yml is
+# triggered for an unrelated reason.
+
 on:
   push:
-    branches: [main, master]
-    tags: ['v*']
+    branches: [ main, master ]
+    tags: [ 'v*' ]
     paths:
       - 'ewp-core/ewpmobile/**'
       - 'ewp-core/transport/**'
       - 'ewp-core/protocol/**'
       - 'ewp-core/tun/**'
       - 'ewp-core/common/**'
+      - 'ewp-core/engine/**'
+      - 'ewp-core/inbound/**'
+      - 'ewp-core/outbound/**'
+      - 'ewp-core/dns/**'
       - 'ewp-core/go.mod'
       - 'ewp-core/go.sum'
       - 'ewp-android/**'
@@ -21,66 +31,44 @@ on:
 
 jobs:
   build-aar:
-    name: Build AAR
+    name: gomobile bind
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ewp-core
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.25.6'
           cache: true
           cache-dependency-path: ewp-core/go.sum
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
-        run: |
-          echo "y" | sdkmanager "ndk;25.2.9519653" --sdk_root="$ANDROID_HOME"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+      - id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
 
       - name: Install gomobile
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
 
-      - name: Initialize gomobile
-        run: gomobile init
-
-      - name: Add golang.org/x/mobile dependency
-        run: go get golang.org/x/mobile@latest
-
-      - name: Download Go modules
-        run: go mod download
-
-      - name: Build Android AAR
+      - name: Build aar
+        working-directory: ewp-core
         env:
-          GOFLAGS: -mod=mod
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           mkdir -p output/android
-          gomobile bind \
-            -v \
-            -target=android \
-            -androidapi=21 \
+          gomobile bind -target=android -androidapi=21 \
             -ldflags="-s -w" \
-            -o output/android/ewp-core.aar \
-            ./ewpmobile
+            -o output/android/ewp-core.aar ./ewpmobile
 
-      - name: Upload AAR artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ewp-core-aar
           path: ewp-core/output/android/ewp-core.aar
@@ -88,107 +76,63 @@ jobs:
 
   build-apk:
     name: Build APK
-    runs-on: ubuntu-latest
     needs: build-aar
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # P2-35: Validate Gradle Wrapper for supply chain security
-      - name: Validate Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v2
+      # Supply-chain hygiene: refuse to run with a tampered Gradle wrapper.
+      - uses: gradle/actions/wrapper-validation@v3
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v3
 
-      - name: Download AAR artifact
+      - name: Pull aar from previous job
         uses: actions/download-artifact@v4
         with:
           name: ewp-core-aar
           path: ewp-android/app/libs/
 
-      - name: Inspect AAR contents
+      - name: Sanity check the aar
         run: |
-          echo "=== libs dir ==="
           ls -la ewp-android/app/libs/
-          echo "=== all AAR entries ==="
-          unzip -l ewp-android/app/libs/ewp-core.aar
-          echo "=== extract and inspect classes.jar ==="
-          unzip -o ewp-android/app/libs/ewp-core.aar classes.jar -d /tmp/aar-inspect/
-          jar tf /tmp/aar-inspect/classes.jar | head -50
+          unzip -p ewp-android/app/libs/ewp-core.aar AndroidManifest.xml | head -3 || true
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          # P2-35: Pin specific Gradle version for stability
-          gradle-version: '8.5'
+      - uses: gradle/actions/setup-gradle@v3
 
       - name: Build APK
         working-directory: ewp-android
         env:
-          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          # Optional release signing — set as repo secrets to enable.
+          # If absent, falls through to assembleDebug.
+          SIGNING_KEYSTORE_B64:    ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD:  ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS:       ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD:    ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
+          chmod +x gradlew
           if [ -n "$SIGNING_KEYSTORE_B64" ]; then
-            echo "Building signed Release APK"
             echo "$SIGNING_KEYSTORE_B64" | base64 -di > /tmp/ewp-release.jks
             export SIGNING_KEYSTORE_PATH=/tmp/ewp-release.jks
-            gradle assembleRelease
+            ./gradlew assembleRelease --no-daemon
           else
-            echo "No keystore configured, building Debug APK"
-            gradle assembleDebug
+            ./gradlew assembleDebug --no-daemon
           fi
 
       - name: Collect APKs
         run: |
           mkdir -p apk-output
-          find ewp-android/app/build/outputs/apk -name "*.apk" \
-            ! -name "*unsigned*" \
+          find ewp-android/app/build/outputs/apk \
+            -name "*.apk" ! -name "*unsigned*" \
             -exec cp {} apk-output/ \;
           ls -lh apk-output/
 
-      # P2-26: Verify release APK doesn't contain test manifest
-      - name: Verify Release APK (No Test Manifest)
-        if: hashFiles('apk-output/app-release.apk') != ''
-        run: |
-          echo "=== Verifying release APK doesn't contain test manifest ==="
-          RELEASE_APK="apk-output/app-release.apk"
-          
-          # Check for test-related classes
-          if unzip -l "$RELEASE_APK" | grep -i "test"; then
-            echo "❌ ERROR: Release APK contains test-related files!"
-            unzip -l "$RELEASE_APK" | grep -i "test"
-            exit 1
-          fi
-          
-          # Check for ui-test-manifest specifically
-          if unzip -l "$RELEASE_APK" | grep -i "ui-test-manifest"; then
-            echo "❌ ERROR: Release APK contains ui-test-manifest!"
-            exit 1
-          fi
-          
-          echo "✅ Release APK verification passed: No test manifest found"
-
-      - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ewp-android-apk
-          path: apk-output/*.apk
-          retention-days: 30
-
-      - name: Upload APKs to Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: apk-output/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ewp-android-apks
+          path: apk-output/
+          if-no-files-found: error

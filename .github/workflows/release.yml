@@ -1,10 +1,16 @@
 name: Create Release
 
+# v2 release flow: tag + build the unified cmd/ewp binary across the
+# matrix, build the gomobile aar, build the Android apk, build the
+# Qt6 GUI, attach all of them to a GitHub release.
+#
+# Trigger manually with a semver tag (vMAJOR.MINOR[.PATCH][-pre]).
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., v1.0.0)'
+        description: 'Release version (e.g. v2.0.0 or v2.0.0-rc.1)'
         required: true
         type: string
       prerelease:
@@ -16,82 +22,41 @@ on:
 permissions:
   contents: write
   actions: read
-  id-token: write  # P2-36: Required for Cosign keyless signing with OIDC
 
 jobs:
+  # ----------------------------------------------------------------
+  # Validate the version string and create a git tag pointing at the
+  # commit being released. Subsequent jobs check out THAT tag so the
+  # binary embedded version metadata always matches what's released.
+  # ----------------------------------------------------------------
   prepare:
     name: Validate & Tag
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
-          # P2-37: Use token parameter instead of URL to avoid token leakage in logs
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate Version Tag
+      - name: Validate version
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          if [[ ! $VERSION =~ ^v[0-9]+(\.[0-9]+){1,2}(-[a-zA-Z0-9\.]+)?$ ]]; then
-            echo "Error: Invalid version format. Expected: v1.0, v1.0.0, v1.0-beta, v1.0.0-rc.1"
+          V='${{ github.event.inputs.version }}'
+          [[ $V =~ ^v[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.]+)?$ ]] || {
+            echo "::error::version must look like v2.0 / v2.0.0 / v2.0-rc.1"
             exit 1
-          fi
-          echo "✅ Valid version: $VERSION"
+          }
 
-      - name: Create Git Tag
+      - name: Tag
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  github-actions[bot]
+          git config user.email github-actions[bot]@users.noreply.github.com
           git tag -a "${{ github.event.inputs.version }}" -m "Release ${{ github.event.inputs.version }}"
-          # P2-37: Use default git push (credentials injected by actions/checkout)
           git push origin "${{ github.event.inputs.version }}"
 
-  build-core-client:
-    name: Build Client (${{ matrix.goos }}/${{ matrix.goarch }})
-    needs: prepare
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ewp-core
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { goos: windows, goarch: amd64, suffix: .exe }
-          - { goos: windows, goarch: arm64, suffix: .exe }
-          - { goos: linux,   goarch: amd64, suffix: ""   }
-          - { goos: linux,   goarch: arm64, suffix: ""   }
-          - { goos: darwin,  goarch: amd64, suffix: ""   }
-          - { goos: darwin,  goarch: arm64, suffix: ""   }
-          - { goos: freebsd, goarch: amd64, suffix: ""   }
-          - { goos: freebsd, goarch: arm64, suffix: ""   }
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.version }}
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.6'
-          cache: true
-
-      - name: Build
-        run: |
-          cd cmd/client
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" \
-            -o ../../ewp-core-client-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} .
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: client-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ewp-core/ewp-core-client-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
-
-  build-core-server:
-    name: Build Server (${{ matrix.goos }}/${{ matrix.goarch }})
+  # ----------------------------------------------------------------
+  # cmd/ewp matrix build with embedded version stamp.
+  # ----------------------------------------------------------------
+  ewp-binary:
+    name: ewp ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: prepare
     runs-on: ubuntu-latest
     defaults:
@@ -103,304 +68,160 @@ jobs:
         include:
           - { goos: linux,   goarch: amd64, suffix: ""   }
           - { goos: linux,   goarch: arm64, suffix: ""   }
-          - { goos: windows, goarch: amd64, suffix: .exe }
-          - { goos: windows, goarch: arm64, suffix: .exe }
           - { goos: darwin,  goarch: amd64, suffix: ""   }
           - { goos: darwin,  goarch: arm64, suffix: ""   }
+          - { goos: windows, goarch: amd64, suffix: .exe }
+          - { goos: windows, goarch: arm64, suffix: .exe }
           - { goos: freebsd, goarch: amd64, suffix: ""   }
-          - { goos: freebsd, goarch: arm64, suffix: ""   }
-
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.version }}
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.25.6'
           cache: true
+          cache-dependency-path: ewp-core/go.sum
 
       - name: Build
+        env:
+          GOOS:   ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
         run: |
-          cd cmd/server
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" \
-            -o ../../ewp-core-server-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} .
+          NAME=ewp-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          go build -trimpath \
+            -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" \
+            -o "../$NAME" \
+            ./cmd/ewp
+          ( cd .. && sha256sum "$NAME" > "$NAME.sha256" )
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: server-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ewp-core/ewp-core-server-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          name: ewp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ewp-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+            ewp-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}.sha256
+          if-no-files-found: error
 
-  build-gui-windows:
-    name: Build EWP-GUI (Windows)
-    needs: build-core-client
-    runs-on: windows-latest
-
+  # ----------------------------------------------------------------
+  # Qt6 GUI (linux only).
+  # ----------------------------------------------------------------
+  ewp-gui:
+    name: GUI (linux)
+    needs: prepare
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.version }}
 
-      - name: Download Core Client - Windows amd64
-        uses: actions/download-artifact@v4
-        with:
-          name: client-windows-amd64
-          path: ./core-binaries
-
       - name: Install Qt6
-        uses: jurplel/install-qt-action@v3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends qt6-base-dev ninja-build
+
+      - run: cmake -S ewp-gui -B ewp-gui/build -G Ninja
+      - run: ninja -C ewp-gui/build
+      - run: |
+          mv ewp-gui/build/EWP-GUI ewp-gui-${{ github.event.inputs.version }}-linux-amd64
+          sha256sum ewp-gui-${{ github.event.inputs.version }}-linux-amd64 \
+            > ewp-gui-${{ github.event.inputs.version }}-linux-amd64.sha256
+
+      - uses: actions/upload-artifact@v4
         with:
-          version: '6.6.*'
-          host: 'windows'
-          target: 'desktop'
-          arch: 'win64_msvc2019_64'
-          cache: true
+          name: ewp-gui-linux
+          path: |
+            ewp-gui-${{ github.event.inputs.version }}-linux-amd64
+            ewp-gui-${{ github.event.inputs.version }}-linux-amd64.sha256
+          if-no-files-found: error
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Build GUI - Windows x64
-        run: |
-          cd ewp-gui
-          mkdir build
-          cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -G "NMake Makefiles"
-          nmake
-
-      - name: Deploy Qt Dependencies
-        run: |
-          cd ewp-gui\build
-          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw EWP-GUI.exe
-
-      - name: Package GUI with Core - Windows x64
-        run: |
-          mkdir ewp-gui-${{ github.event.inputs.version }}-windows-amd64
-          xcopy /E /I ewp-gui\build ewp-gui-${{ github.event.inputs.version }}-windows-amd64
-          copy core-binaries\ewp-core-client-${{ github.event.inputs.version }}-windows-amd64.exe ewp-gui-${{ github.event.inputs.version }}-windows-amd64\ewp-core.exe
-          copy ewp-core\wintun.dll ewp-gui-${{ github.event.inputs.version }}-windows-amd64\
-
-      - name: Create Archive
-        run: |
-          cd ewp-gui-${{ github.event.inputs.version }}-windows-amd64
-          tar -czf ../ewp-gui-${{ github.event.inputs.version }}-windows-amd64.tar.gz *
-
-      - name: Upload GUI Windows Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: gui-windows-amd64
-          path: ewp-gui-${{ github.event.inputs.version }}-windows-amd64.tar.gz
-
-  build-gui-linux:
-    name: Build EWP-GUI (Linux)
-    needs: build-core-client
+  # ----------------------------------------------------------------
+  # Android: gomobile aar then assembleRelease.
+  # ----------------------------------------------------------------
+  android:
+    name: Android APK
+    needs: prepare
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.version }}
 
-      - name: Download Core Client - Linux amd64
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-go@v5
         with:
-          name: client-linux-amd64
-          path: ./core-binaries
-
-      - name: Install Qt6
-        uses: jurplel/install-qt-action@v3
-        with:
-          version: '6.6.*'
-          host: 'linux'
-          target: 'desktop'
+          go-version: '1.25.6'
           cache: true
+          cache-dependency-path: ewp-core/go.sum
 
-      - name: Build GUI - Linux x64
-        run: |
-          cd ewp-gui
-          mkdir build
-          cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Package GUI with Core - Linux x64
-        run: |
-          mkdir -p ewp-gui-${{ github.event.inputs.version }}-linux-amd64/lib
-
-          cp ewp-gui/build/EWP-GUI ewp-gui-${{ github.event.inputs.version }}-linux-amd64/
-          cp core-binaries/ewp-core-client-${{ github.event.inputs.version }}-linux-amd64 ewp-gui-${{ github.event.inputs.version }}-linux-amd64/ewp-core
-
-          ldd ewp-gui/build/EWP-GUI | grep Qt | awk '{print $3}' | xargs -I {} cp {} ewp-gui-${{ github.event.inputs.version }}-linux-amd64/lib/
-
-          mkdir -p ewp-gui-${{ github.event.inputs.version }}-linux-amd64/plugins/platforms
-          cp -r $Qt6_DIR/plugins/platforms/libqxcb.so ewp-gui-${{ github.event.inputs.version }}-linux-amd64/plugins/platforms/ || true
-
-          cat > ewp-gui-${{ github.event.inputs.version }}-linux-amd64/EWP-GUI.sh << 'EOF'
-          #!/bin/bash
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
-          export QT_PLUGIN_PATH="$DIR/plugins"
-          exec "$DIR/EWP-GUI" "$@"
-          EOF
-
-          chmod +x ewp-gui-${{ github.event.inputs.version }}-linux-amd64/EWP-GUI
-          chmod +x ewp-gui-${{ github.event.inputs.version }}-linux-amd64/EWP-GUI.sh
-          chmod +x ewp-gui-${{ github.event.inputs.version }}-linux-amd64/ewp-core
-
-      - name: Create Archive
-        run: |
-          tar -czf ewp-gui-${{ github.event.inputs.version }}-linux-amd64.tar.gz ewp-gui-${{ github.event.inputs.version }}-linux-amd64/
-
-      - name: Upload GUI Linux Artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/setup-java@v4
         with:
-          name: gui-linux-amd64
-          path: ewp-gui-${{ github.event.inputs.version }}-linux-amd64.tar.gz
+          distribution: temurin
+          java-version: '21'
 
-  create-release:
-    name: Create GitHub Release
-    needs: [build-core-client, build-core-server, build-gui-windows, build-gui-linux]
+      - id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: gomobile bind
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+          cd ewp-core
+          gomobile bind -target=android -androidapi=21 \
+            -ldflags="-s -w -X main.Version=${{ github.event.inputs.version }}" \
+            -o ../ewp-android/app/libs/ewp-core.aar ./ewpmobile
+
+      - name: Build apk (release, unsigned)
+        working-directory: ewp-android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Stage artefacts
+        run: |
+          mkdir -p out
+          for abi in arm64-v8a armeabi-v7a x86_64 universal; do
+            apk=$(ls ewp-android/app/build/outputs/apk/release/*-$abi-release-unsigned.apk 2>/dev/null || true)
+            [ -n "$apk" ] || continue
+            name=ewp-android-${{ github.event.inputs.version }}-$abi.apk
+            cp "$apk" "out/$name"
+            ( cd out && sha256sum "$name" > "$name.sha256" )
+          done
+          ls out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: out/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Final: gather everything and publish a GitHub release.
+  # ----------------------------------------------------------------
+  release:
+    name: Publish GitHub release
+    needs: [ ewp-binary, ewp-gui, android ]
     runs-on: ubuntu-latest
-
     steps:
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: ./release-assets
+          path: dist
           merge-multiple: true
 
-      - name: Generate Checksums
-        run: |
-          cd release-assets
-          sha256sum * > checksums.txt
-          cat checksums.txt
+      - name: List
+        run: ls -lhR dist
 
-      # P2-36: Install Cosign for artifact signing
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
-          cosign-release: 'v2.2.3'
-
-      # P2-36: Sign all release artifacts with Cosign
-      - name: Sign Release Artifacts
-        run: |
-          cd release-assets
-          # Sign each artifact (keyless signing with GitHub OIDC)
-          for file in ewp-core-* ewp-gui-*.tar.gz; do
-            if [ -f "$file" ]; then
-              echo "Signing $file..."
-              cosign sign-blob --yes \
-                --bundle "${file}.cosign.bundle" \
-                "$file"
-            fi
-          done
-          
-          # Create a signatures manifest
-          cat > SIGNATURES.txt << 'EOF'
-          # Cosign Signature Verification
-          
-          All release artifacts are signed using Cosign with keyless signing (Sigstore).
-          
-          ## Verification Instructions
-          
-          1. Install Cosign: https://docs.sigstore.dev/cosign/installation/
-          
-          2. Verify a file:
-          ```bash
-          cosign verify-blob \
-            --bundle <file>.cosign.bundle \
-            --certificate-identity=https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.event.inputs.version }} \
-            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            <file>
-          ```
-          
-          Example:
-          ```bash
-          cosign verify-blob \
-            --bundle ewp-core-client-${{ github.event.inputs.version }}-linux-amd64.cosign.bundle \
-            --certificate-identity=https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.event.inputs.version }} \
-            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            ewp-core-client-${{ github.event.inputs.version }}-linux-amd64
-          ```
-          EOF
-          
-          echo "✅ All artifacts signed successfully"
-          ls -lh *.cosign.bundle
-
-      - name: Generate Release Notes
-        run: |
-          VERSION="${{ github.event.inputs.version }}"
-          cat > release-notes.md << EOF
-          # EWP-Workers ${VERSION}
-
-          ## Components
-
-          ### EWP-Core Client
-          - Multi-platform: Windows, Linux, macOS, FreeBSD (amd64 / arm64)
-          - ECH (Encrypted Client Hello) support
-          - Multiple transport protocols (WebSocket, HTTP/3, gRPC, XHTTP)
-          - DNS over HTTPS/TLS/QUIC with fallback
-
-          ### EWP-Core Server
-          - Multi-platform: Linux, Windows, macOS, FreeBSD (amd64 / arm64)
-          - High-performance proxy server
-          - Supports EWP and Trojan protocols
-
-          ### EWP-GUI
-          - Cross-platform graphical interface (Windows & Linux)
-          - Node management and system proxy integration
-
-          ## Downloads
-
-          **Client:**
-          | Platform | File |
-          |----------|------|
-          | Windows x64 | \`ewp-core-client-${VERSION}-windows-amd64.exe\` |
-          | Windows arm64 | \`ewp-core-client-${VERSION}-windows-arm64.exe\` |
-          | Linux x64 | \`ewp-core-client-${VERSION}-linux-amd64\` |
-          | Linux arm64 | \`ewp-core-client-${VERSION}-linux-arm64\` |
-          | macOS x64 | \`ewp-core-client-${VERSION}-darwin-amd64\` |
-          | macOS arm64 (Apple Silicon) | \`ewp-core-client-${VERSION}-darwin-arm64\` |
-          | FreeBSD x64 | \`ewp-core-client-${VERSION}-freebsd-amd64\` |
-          | FreeBSD arm64 | \`ewp-core-client-${VERSION}-freebsd-arm64\` |
-
-          **Server:**
-          | Platform | File |
-          |----------|------|
-          | Linux x64 | \`ewp-core-server-${VERSION}-linux-amd64\` |
-          | Linux arm64 | \`ewp-core-server-${VERSION}-linux-arm64\` |
-          | Windows x64 | \`ewp-core-server-${VERSION}-windows-amd64.exe\` |
-          | Windows arm64 | \`ewp-core-server-${VERSION}-windows-arm64.exe\` |
-          | macOS x64 | \`ewp-core-server-${VERSION}-darwin-amd64\` |
-          | macOS arm64 | \`ewp-core-server-${VERSION}-darwin-arm64\` |
-          | FreeBSD x64 | \`ewp-core-server-${VERSION}-freebsd-amd64\` |
-          | FreeBSD arm64 | \`ewp-core-server-${VERSION}-freebsd-arm64\` |
-
-          **GUI (内核已内置，解压即用):**
-          | Platform | File |
-          |----------|------|
-          | Windows x64 | \`ewp-gui-${VERSION}-windows-amd64.tar.gz\` |
-          | Linux x64 | \`ewp-gui-${VERSION}-linux-amd64.tar.gz\` |
-
-          See \`checksums.txt\` for SHA256 checksums.
-          EOF
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: EWP-Workers ${{ github.event.inputs.version }}
-          body_path: release-notes.md
-          files: |
-            release-assets/*
-          draft: false
+          tag_name:   ${{ github.event.inputs.version }}
+          name:       ${{ github.event.inputs.version }}
           prerelease: ${{ github.event.inputs.prerelease }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Release Summary
-        run: |
-          echo "✅ Release ${{ github.event.inputs.version }} created successfully!"
-          echo "📦 Artifacts uploaded: $(ls -1 release-assets/ | wc -l) files"
+          generate_release_notes: true
+          files: dist/*

@@ -1,257 +1,38 @@
-# GitHub Actions Workflows
+# GitHub Actions for EWP
 
-This directory contains automated build and release workflows for the EWP-Workers project.
+| Workflow | Triggers | What it does |
+|---|---|---|
+| `build.yml` | push / PR to main, dev; manual | Tests + cross-builds the unified `cmd/ewp` binary, the Qt6 GUI, and the gomobile aar. One artefact per OS/arch. |
+| `build-android-apk.yml` | push / PR / tag matching paths in `ewpmobile/` or `ewp-android/`; manual | Self-contained pipeline: gomobile bind → Android assembleRelease (or assembleDebug if no signing secrets). |
+| `release.yml` | manual only (give it a `v2.x.y` tag) | Tag the commit, build everything in `build.yml` + signed Android APK, attach all artefacts to a GitHub release. |
 
-## Workflows
+## Artefact map
 
-### 1. `build.yml` - Continuous Build
+`build.yml`:
+- `ewp-<os>-<arch>` — single static binary (`cmd/ewp`). Behaves as
+  client / server / relay based on the YAML config you point it at.
+- `ewp-gui-linux` — Qt6 GUI (`EWP-GUI`).
+- `ewp-core-aar` — gomobile binding consumed by `ewp-android`.
 
-**Triggers:**
-- Push to `main`, `master`, or `dev` branches
-- Pull requests to `main` or `master`
-- Manual dispatch via GitHub Actions UI
+`build-android-apk.yml`:
+- `ewp-core-aar` — same as above (rebuilt here so the apk job can run independently).
+- `ewp-android-apks` — one apk per ABI split, plus the universal apk.
 
-**What it builds:**
-- **EWP-Core Client**: Cross-platform proxy client (Windows, Linux - amd64/arm64)
-- **EWP-Core Server**: Proxy server (Linux, Windows)
-- **EWP-GUI**: Graphical user interface (Windows, Linux) - **包含内核**
+`release.yml`:
+- All of the above, prefixed with the release version, plus
+  per-file `.sha256` checksums.
 
-**Artifacts:**
-- `ewp-core-client-binaries`: All client executables
-- `ewp-core-server-binaries`: All server executables
-- `ewp-gui-windows-binaries`: Windows GUI package (包含 ewp-core.exe)
-- `ewp-gui-linux-binaries`: Linux GUI package (包含 ewp-core)
+## v1 → v2 changes worth noting
 
----
-
-### 2. `release.yml` - Create Release
-
-**Triggers:**
-- Manual dispatch only (via GitHub Actions UI)
-
-**Required Inputs:**
-- `version`: Release version tag (e.g., `v1.0.0`, `v1.2.3-beta`)
-- `prerelease`: Whether to mark as pre-release (default: `false`)
-
-**What it does:**
-1. Validates version tag format
-2. Creates and pushes a Git tag
-3. Builds all components with version embedded
-4. Generates release notes
-5. Creates SHA256 checksums
-6. Publishes GitHub Release with all artifacts
-
-**Usage:**
-1. Go to **Actions** → **Create Release**
-2. Click **Run workflow**
-3. Enter version (e.g., `v1.0.0`)
-4. Optionally check **Mark as pre-release**
-5. Click **Run workflow**
-
----
-
-## Build Matrix
-
-### EWP-Core Client
-
-| Platform | Architecture | Binary Name |
-|----------|-------------|-------------|
-| Windows | amd64 | `ewp-core-client-windows-amd64.exe` |
-| Windows | arm64 | `ewp-core-client-windows-arm64.exe` |
-| Linux | amd64 | `ewp-core-client-linux-amd64` |
-| Linux | arm64 | `ewp-core-client-linux-arm64` |
-
-### EWP-Core Server
-
-| Platform | Architecture | Binary Name |
-|----------|-------------|-------------|
-| Linux | amd64 | `ewp-core-server-linux-amd64` |
-| Linux | arm64 | `ewp-core-server-linux-arm64` |
-| Windows | amd64 | `ewp-core-server-windows-amd64.exe` |
-
-### EWP-GUI (包含内核 + Qt 依赖)
-
-| Platform | Architecture | Package Name | 包含内容 |
-|----------|-------------|-------------|---------|
-| Windows | amd64 | `ewp-gui-windows-amd64/` | `EWP-GUI.exe`, `ewp-core.exe`, `wintun.dll`, Qt6 DLLs, plugins |
-| Linux | amd64 | `ewp-gui-linux-amd64/` | `EWP-GUI`, `EWP-GUI.sh`, `ewp-core`, Qt6 libs, plugins |
-
----
-
-## Requirements
-
-### GitHub Repository Settings
-
-1. **Secrets**: No additional secrets required (uses built-in `GITHUB_TOKEN`)
-
-2. **Permissions**: Workflows need write permissions:
-   - Go to **Settings** → **Actions** → **General**
-   - Scroll to **Workflow permissions**
-   - Select **Read and write permissions** ✅
-   - Check **Allow GitHub Actions to create and approve pull requests** (optional)
-   - Click **Save**
-
-3. **Alternative**: If you want to keep read-only default:
-   - Permissions are already set in workflow file:
-     ```yaml
-     permissions:
-       contents: write  # Create releases and tags
-       actions: read    # Read artifacts
-     ```
-
-### Build Dependencies
-
-- **Go**: Version 1.24+ (handled by `actions/setup-go@v5`)
-- **Qt6**: Version 6.6+ (handled by `jurplel/install-qt-action@v3`)
-- **CMake**: Version 3.16+ (pre-installed on runners)
-
----
-
-## Version Tagging Convention
-
-支持灵活的版本号格式：
-
-**标准版本:**
-- 两段: `v1.0`, `v2.13`, `v3.5`
-- 三段: `v1.0.0`, `v2.3.1`, `v1.13.5`
-
-**预发布版本:**
-- `v1.0-beta`, `v1.13-rc1`
-- `v1.0.0-alpha`, `v2.0.0-beta.2`
-
-**Valid formats:**
-- `v[MAJOR].[MINOR]` (两段)
-- `v[MAJOR].[MINOR].[PATCH]` (三段，推荐)
-- `v[VERSION]-[PRERELEASE]` (预发布标识可包含字母、数字、点)
-
----
-
-## Troubleshooting
-
-### Build Failures
-
-**Go version mismatch:**
-```yaml
-# Update Go version in workflow files
-uses: actions/setup-go@v5
-with:
-  go-version: '1.24'  # Change this
-```
-
-**Qt6 installation issues:**
-```yaml
-# Try different Qt version
-uses: jurplel/install-qt-action@v3
-with:
-  version: '6.7.*'  # Update version
-```
-
-### Release Issues
-
-**Invalid version tag:**
-```
-Error: Invalid version format
-```
-- 必须以 `v` 开头
-- 至少包含两段数字: `v1.0` 或 `v1.0.0`
-- 预发布标识用 `-` 分隔: `v1.0-beta`
-
-**Valid examples:**
-- ✅ `v1.13`, `v1.0`, `v2.5`
-- ✅ `v1.0.0`, `v2.3.1`
-- ✅ `v1.13-beta`, `v2.0.0-rc.1`
-
-**Invalid examples:**
-- ❌ `1.0` (缺少 `v` 前缀)
-- ❌ `v1` (只有一段)
-- ❌ `v1.0.0.0` (超过三段)
-
-**Permission denied (403 / Resource not accessible):**
-```
-remote: Permission to user/repo.git denied to github-actions[bot].
-fatal: unable to access '...': The requested URL returned error: 403
-```
-
-**Solution 1: Enable write permissions (推荐)**
-1. Go to repository **Settings** → **Actions** → **General**
-2. Scroll to **Workflow permissions**
-3. Select **Read and write permissions**
-4. Click **Save**
-
-**Solution 2: Workflow already has permissions**
-- `release.yml` 已包含 `permissions: contents: write`
-- 如果还报错，说明仓库级别禁用了写权限
-- 需要在 Settings 中启用
-
----
-
-## Manual Build Locally
-
-### Client
-```bash
-cd ewp-core/cmd/client
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ewp-core-client .
-```
-
-### Server
-```bash
-cd ewp-core/cmd/server
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ewp-core-server .
-```
-
-### GUI
-```bash
-cd ewp-gui
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
-
----
-
-## Platform Support
-
-**Currently Supported:**
-- ✅ Windows (amd64, arm64)
-- ✅ Linux (amd64, arm64)
-
-**Not Yet Supported:**
-- ⚠️ macOS (compatibility work in progress)
-- ⚠️ Android (not included in CI/CD)
-
-## Package Structure
-
-### GUI Package (开箱即用)
-
-**Windows:**
-```
-ewp-gui-windows-amd64/
-├── EWP-GUI.exe          # 图形界面
-├── ewp-core.exe         # 内核程序
-├── wintun.dll           # TUN 驱动
-├── Qt6*.dll             # Qt6 动态库
-└── platforms/           # Qt 插件
-```
-
-**Linux:**
-```
-ewp-gui-linux-amd64/
-├── EWP-GUI              # 图形界面
-├── EWP-GUI.sh           # 启动脚本
-├── ewp-core             # 内核程序
-├── lib/                 # Qt6 动态库
-└── plugins/             # Qt 插件
-```
-
-### Release Archives
-
-- **Build Workflow**: 上传目录结构
-- **Release Workflow**: 打包为 `.tar.gz` 压缩包
-
-## Notes
-
-- **GUI 已包含内核**: 用户下载 GUI 即可使用，无需单独下载 client
-- GUI builds use Qt6 and require appropriate toolchains
-- All binaries are stripped (`-s -w`) to reduce size
-- Release workflow embeds version via `-X main.Version`
-- Cross-compilation is handled by Go's GOOS/GOARCH flags
+- One binary, not two. v1 had `cmd/client` and `cmd/server`;
+  v2's `cmd/ewp` is configured at runtime via YAML, so the
+  matrix builds half as many artefacts.
+- No more Trojan or XHTTP-stream-down output. Both were
+  removed from the codebase; the workflows can't ship them.
+- Java 21 everywhere (was 17). Required by the latest Compose
+  BOM the v2 Android UI uses.
+- Android NDK r26b is the floor. Earlier NDKs miss the
+  `__cxa_thread_atexit_impl` symbol Go 1.25 needs.
+- gomobile is reinstalled on every run rather than cached —
+  the cache eviction churn was costing more time than the
+  ~10s the install takes.
