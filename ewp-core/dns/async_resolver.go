@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -61,6 +62,20 @@ type AsyncResolverConfig struct {
 	CacheSize    int           // default 16384
 	WorkerPool   int           // default 8
 	QueueDepth   int           // default 256
+
+	// Dialer, when non-nil, is the *net.Dialer used by the underlying
+	// DoH MultiClient for TCP connections. On a client running TUN
+	// inbound this MUST be the bypass dialer — otherwise the DoH
+	// request goes through the OS routing table, gets caught by the
+	// TUN's default route, looped back into ewpclient outbound, and
+	// ewpclient itself needs DNS to start dialing. Wireshark on the
+	// physical NIC then shows zero TLS ClientHellos and the whole
+	// resolver hangs.
+	//
+	// Server / non-TUN setups can leave this nil; the default zero
+	// net.Dialer is fine when no in-process default route hijack is
+	// in play.
+	Dialer       *net.Dialer
 }
 
 // NewAsyncResolver constructs an AsyncResolver and starts the worker
@@ -82,7 +97,7 @@ func NewAsyncResolver(cfg AsyncResolverConfig) *AsyncResolver {
 		cfg.QueueDepth = 256
 	}
 	r := &AsyncResolver{
-		doh:      NewMultiClient(cfg.DoHServers, nil),
+		doh:      NewMultiClient(cfg.DoHServers, cfg.Dialer),
 		minTTL:   cfg.MinTTL,
 		maxTTL:   cfg.MaxTTL,
 		cache:    make(map[cacheKey]*list.Element),

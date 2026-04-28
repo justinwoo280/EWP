@@ -38,6 +38,7 @@ import (
 // you get if the user did not configure a client_dns block.
 type Resolver struct {
 	mc          *dns.MultiClient
+	servers     []string
 	timeout     time.Duration
 	cacheTTL    time.Duration
 	preferIPv6  bool
@@ -58,6 +59,28 @@ type Config struct {
 	Timeout    time.Duration // per-query budget; 3s if zero
 	CacheTTL   time.Duration // positive-cache TTL; 5min if zero
 	PreferIPv6 bool          // when both A and AAAA exist, pick AAAA first
+}
+
+// SetDialer rebuilds the underlying DoH MultiClient against the
+// supplied *net.Dialer. Used after TUN setup discovers the bypass
+// dialer — without this hook the resolver's DoH TCP traffic is
+// captured by the TUN's default route and loops back into ewpclient,
+// hanging the resolver forever ("[DoH Client] no ClientHellos on
+// the physical NIC" symptom).
+//
+// Idempotent: callable multiple times if the bypass changes
+// (interface flap, etc.). nil resets to OS default.
+func (r *Resolver) SetDialer(d *net.Dialer) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	servers := r.servers
+	r.mu.Unlock()
+	mc := dns.NewMultiClient(servers, d)
+	r.mu.Lock()
+	r.mc = mc
+	r.mu.Unlock()
 }
 
 // New builds a Resolver. Returns nil (and no error) if Servers is
@@ -84,6 +107,7 @@ func New(cfg Config) (*Resolver, error) {
 
 	return &Resolver{
 		mc:         mc,
+		servers:    append([]string(nil), cfg.Servers...),
 		timeout:    cfg.Timeout,
 		cacheTTL:   cfg.CacheTTL,
 		preferIPv6: cfg.PreferIPv6,

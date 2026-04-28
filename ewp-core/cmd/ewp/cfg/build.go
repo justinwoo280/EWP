@@ -29,7 +29,7 @@ import (
 // with a clear error if a tun inbound is configured; bring up TUN
 // out-of-process or wait for the upcoming tun.AsInbound bootstrap
 // improvements.
-func BuildInbound(c InboundCfg) (engine.Inbound, error) {
+func BuildInbound(c InboundCfg, onBypass BypassSink) (engine.Inbound, error) {
 	switch c.Type {
 	case "socks5":
 		if c.Listen == "" {
@@ -47,7 +47,7 @@ func BuildInbound(c InboundCfg) (engine.Inbound, error) {
 		return buildEWPServerInbound(c)
 
 	case "tun":
-		return buildTUNInbound(c)
+		return buildTUNInbound(c, onBypass)
 
 	default:
 		return nil, fmt.Errorf("unknown inbound type %q", c.Type)

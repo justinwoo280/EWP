@@ -57,6 +57,11 @@ func New(tag string, t transport.Transport, uuid [v2.UUIDLen]byte) *Outbound {
 
 func (o *Outbound) Tag() string { return o.tag }
 
+// Transport returns the underlying transport.Transport so that
+// post-startup wiring (e.g. main injecting a bypass dialer once a TUN
+// inbound provides it) can call SetBypassConfig on it.
+func (o *Outbound) Transport() transport.Transport { return o.transport }
+
 func (o *Outbound) Close() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()

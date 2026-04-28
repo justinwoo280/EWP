@@ -23,6 +23,8 @@ import (
 	"ewp-core/inbound/ewpserver"
 	"ewp-core/log"
 	"ewp-core/outbound/direct"
+	"ewp-core/outbound/ewpclient"
+	"ewp-core/transport"
 )
 
 // hasAnyEWPServerInbound reports whether any inbound is an ewpserver
@@ -85,20 +87,24 @@ func main() {
 			len(conf.ServerNameDNS.DoH.Servers))
 	}
 
+	// Collect ewpclient outbounds so we can re-arm their transports
+	// once a TUN inbound delivers the bypass dialer (see onBypass
+	// below). Server-side direct outbounds don't care.
+	var ewpClients []*ewpclient.Outbound
 	for _, oc := range conf.Outbounds {
 		out, err := cfg.BuildOutbound(oc, conf.ECH.BootstrapDoH.Servers, clientResolver)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "outbound %q: %v\n", oc.Tag, err)
 			os.Exit(2)
 		}
-		// If the outbound is a *direct.Outbound and we have a server
-		// resolver, attach it. ewpclient outbounds resolve at the
-		// remote end so they do not need it.
 		if serverResolver != nil {
 			if d, ok := out.(*direct.Outbound); ok {
 				d.SetResolver(serverResolver)
 				log.Printf("[ewp] outbound %q: AsyncResolver attached", oc.Tag)
 			}
+		}
+		if ec, ok := out.(*ewpclient.Outbound); ok {
+			ewpClients = append(ewpClients, ec)
 		}
 		if err := eng.AddOutbound(out); err != nil {
 			fmt.Fprintf(os.Stderr, "AddOutbound %q: %v\n", oc.Tag, err)
@@ -132,8 +138,32 @@ func main() {
 		}
 	}
 
+	// onBypass is invoked once when a TUN inbound discovers the
+	// physical egress interface. We re-arm:
+	//   1) the client-side DoH resolver (so DoH dials don't loop
+	//      through the TUN we just installed)
+	//   2) every ewpclient outbound's transport (so the EWP control
+	//      channel itself dials around the TUN)
+	// Without (1) Wireshark on the physical NIC sees zero TLS
+	// ClientHellos and the whole client hangs at first DNS lookup.
+	onBypass := func(b *transport.BypassConfig) {
+		if b == nil {
+			return
+		}
+		log.Printf("[ewp] bypass dialer received from TUN: re-arming client DoH + outbound transports")
+		if clientResolver != nil {
+			// b.TCPDialer is the *net.Dialer bound to the physical
+			// outbound interface; clientdns.Resolver swaps its
+			// MultiClient to use it.
+			clientResolver.SetDialer(b.TCPDialer)
+		}
+		for _, ec := range ewpClients {
+			ec.Transport().SetBypassConfig(b)
+		}
+	}
+
 	for _, ic := range conf.Inbounds {
-		in, err := cfg.BuildInbound(ic)
+		in, err := cfg.BuildInbound(ic, onBypass)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "inbound %q: %v\n", ic.Tag, err)
 			os.Exit(2)
