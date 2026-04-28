@@ -13,7 +13,7 @@ QJsonObject ConfigGenerator::generateClientConfig(const EWPNode &node,
                                                   bool tunMode)
 {
     QJsonObject cfg;
-    cfg["inbounds"]  = generateInbounds(settings, tunMode);
+    cfg["inbounds"]  = generateInbounds(node, settings, tunMode);
 
     QJsonArray outs;
     outs.append(generateOutbound(node));
@@ -49,18 +49,38 @@ bool ConfigGenerator::saveConfig(const QJsonObject &config, const QString &fileP
 // Inbound (TUN or SOCKS5)
 // =====================================================================
 
-QJsonArray ConfigGenerator::generateInbounds(const SettingsDialog::AppSettings &settings, bool tunMode)
+QJsonArray ConfigGenerator::generateInbounds(const EWPNode &node,
+                                              const SettingsDialog::AppSettings &settings,
+                                              bool tunMode)
 {
     QJsonArray arr;
     QJsonObject in;
     if (tunMode) {
-        in["tag"]      = "tun-in";
-        in["type"]     = "tun";
-        in["ipv4"]     = settings.tunIP;          // e.g. "10.233.0.2/24"
-        in["ipv4_dns"] = settings.tunnelDNS;
-        if (!settings.tunnelDNSv6.isEmpty()) in["ipv6_dns"] = settings.tunnelDNSv6;
+        in["tag"]     = "tun-in";
+        in["type"]    = "tun";
+        // v2 cfg.TUNCfg yaml schema:
+        //   address       — CIDR string, REQUIRED
+        //   dns           — list of strings (v4 + v6 mixed)
+        //   mtu           — int
+        //   fake_ip       — bool (omit, defaults to true on TUN)
+        //   bypass_server — host[:port] of upstream, STRONGLY recommended
+        in["address"] = settings.tunIP;          // e.g. "10.233.0.2/24"
+        QJsonArray dns;
+        if (!settings.tunnelDNS.isEmpty())   dns.append(settings.tunnelDNS);
+        if (!settings.tunnelDNSv6.isEmpty()) dns.append(settings.tunnelDNSv6);
+        if (!dns.isEmpty()) in["dns"] = dns;
         in["mtu"]      = settings.tunMTU;
         in["fake_ip"]  = true;
+        // bypass_server: derived from the chosen node so the TUN
+        // setup probe knows which physical interface to mark for
+        // outbound traffic before installing its default route.
+        // Without this the proxy's own dial would route-loop back
+        // through the TUN. host or host:port both accepted.
+        if (!node.server.isEmpty()) {
+            QString bs = node.server;
+            if (node.serverPort > 0) bs += ":" + QString::number(node.serverPort);
+            in["bypass_server"] = bs;
+        }
     } else {
         in["tag"]    = "local-socks";
         in["type"]   = "socks5";

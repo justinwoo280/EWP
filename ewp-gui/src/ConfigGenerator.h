@@ -25,7 +25,9 @@ public:
     static bool saveConfig(const QJsonObject &config, const QString &filePath);
 
 private:
-    static QJsonArray generateInbounds(const SettingsDialog::AppSettings &settings, bool tunMode);
+    static QJsonArray generateInbounds(const EWPNode &node,
+                                       const SettingsDialog::AppSettings &settings,
+                                       bool tunMode);
     static QJsonObject generateOutbound(const EWPNode &node);
     static QJsonObject generateTransport(const EWPNode &node);
     static QJsonObject generateRouter();
