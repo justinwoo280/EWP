@@ -75,7 +75,11 @@ func (t *Transport) SetBypassConfig(cfg *transport.BypassConfig) {
 	t.mu.Lock()
 	t.bypassCfg = cfg
 	t.rt = nil // force rebuild next Dial
+	echMgr := t.echManager
 	t.mu.Unlock()
+	if echMgr != nil && cfg != nil && cfg.TCPDialer != nil {
+		echMgr.SetBypassDialer(cfg.TCPDialer)
+	}
 }
 
 func (t *Transport) bypass() *transport.BypassConfig {

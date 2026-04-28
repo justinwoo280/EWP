@@ -102,7 +102,15 @@ func (t *Transport) SetHost(host string) { t.host = host }
 func (t *Transport) SetBypassConfig(cfg *transport.BypassConfig) {
 	t.mu.Lock()
 	t.bypassCfg = cfg
+	echMgr := t.echManager
 	t.mu.Unlock()
+	// Forward the dialer to the ECH manager so its lazy first
+	// HTTPS-RR Refresh() bypasses the TUN that just got installed.
+	// Without this the Refresh hits OS routing -> TUN -> ewpclient
+	// -> needs ECH config to dial -> deadlock.
+	if echMgr != nil && cfg != nil && cfg.TCPDialer != nil {
+		echMgr.SetBypassDialer(cfg.TCPDialer)
+	}
 }
 
 func (t *Transport) bypass() *transport.BypassConfig {

@@ -67,7 +67,11 @@ func (t *Transport) SetHost(host string) { t.host = host }
 func (t *Transport) SetBypassConfig(cfg *transport.BypassConfig) {
 	t.mu.Lock()
 	t.bypassCfg = cfg
+	echMgr := t.echManager
 	t.mu.Unlock()
+	if echMgr != nil && cfg != nil && cfg.TCPDialer != nil {
+		echMgr.SetBypassDialer(cfg.TCPDialer)
+	}
 }
 
 func (t *Transport) bypass() *transport.BypassConfig {
