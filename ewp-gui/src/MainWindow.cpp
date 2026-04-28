@@ -1,0 +1,649 @@
+#include "MainWindow.h"
+#include "ui_MainWindow.h"
+
+#include <QMessageBox>
+#include <QInputDialog>
+#include <QClipboard>
+#include <QCloseEvent>
+#include <QSettings>
+#include <QUuid>
+#include <QMenuBar>
+#include <QAction>
+
+#include "ShareLink.h"
+#include "NodeTester.h"
+#include "EditNodeDialog.h"
+#include "SettingsDialog.h"
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
+    , ui(new Ui::MainWindow)
+{
+    ui->setupUi(this);
+    
+    setWindowTitle("EWP GUI");
+    
+    // 初始化管理器
+    coreProcess = new CoreProcess(this);
+    nodeManager = new NodeManager(this);
+    systemProxy = new SystemProxy(this);
+    
+    setupConnections();
+    setupSystemTray();
+    setupNodeTable();
+    setupMenu();
+    loadSettings();
+    
+    updateNodeList();
+    updateStatusBar();
+}
+
+MainWindow::~MainWindow()
+{
+    saveSettings();
+    if (isRunning) {
+        coreProcess->stop();
+        systemProxy->disable();
+    }
+    delete ui;
+}
+
+void MainWindow::setupConnections()
+{
+    // 核心进程信号
+    connect(coreProcess, &CoreProcess::started, this, [this]() {
+        isRunning = true;
+        appendLog("✅ 代理已启动");
+        updateStatusBar();
+    });
+    
+    connect(coreProcess, &CoreProcess::stopped, this, [this]() {
+        isRunning = false;
+        appendLog("⏹️ 代理已停止");
+        updateStatusBar();
+    });
+    
+    connect(coreProcess, &CoreProcess::errorOccurred, this, [this](const QString &error) {
+        appendLog("❌ 错误: " + error);
+        QMessageBox::critical(this, "错误", error);
+    });
+    
+    connect(coreProcess, &CoreProcess::logReceived, this, &MainWindow::appendLog);
+    
+    connect(coreProcess, &CoreProcess::reconnecting, this, [this](int attempt, int maxAttempts) {
+        ui->labelStatus->setText(QString("重连中... (%1/%2)").arg(attempt).arg(maxAttempts));
+    });
+    
+    connect(coreProcess, &CoreProcess::reconnectFailed, this, [this]() {
+        appendLog("❌ 自动重连失败，已达最大重试次数");
+        QMessageBox::warning(this, "重连失败", 
+            QString("核心进程已崩溃，自动重连 %1 次均失败，请检查节点配置后手动重启。")
+                .arg(CoreProcess::kMaxRetries));
+        updateStatusBar();
+        updateNodeList();
+    });
+    
+    // 节点表格双击
+    connect(ui->nodeTable, &QTableWidget::cellDoubleClicked, 
+            this, &MainWindow::onNodeDoubleClicked);
+    
+    // 节点表格右键菜单
+    ui->nodeTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(ui->nodeTable, &QTableWidget::customContextMenuRequested,
+            this, &MainWindow::showNodeContextMenu);
+    
+    // 系统代理复选框
+    connect(ui->checkSystemProxy, &QCheckBox::toggled, 
+            this, &MainWindow::onSystemProxyToggled);
+    connect(ui->checkTunMode, &QCheckBox::toggled, 
+            this, &MainWindow::onTunModeToggled);
+    
+    // 工具栏按钮
+    connect(ui->btnAdd, &QPushButton::clicked, this, &MainWindow::onAddNode);
+    connect(ui->btnEdit, &QPushButton::clicked, this, &MainWindow::onEditNode);
+    connect(ui->btnDelete, &QPushButton::clicked, this, &MainWindow::onDeleteNode);
+    connect(ui->btnTest, &QPushButton::clicked, this, &MainWindow::onTestSelected);
+    connect(ui->btnTestAll, &QPushButton::clicked, this, &MainWindow::onTestAll);
+    connect(ui->btnImport, &QPushButton::clicked, this, &MainWindow::onImportFromClipboard);
+    connect(ui->btnExport, &QPushButton::clicked, this, &MainWindow::onExportToClipboard);
+    connect(ui->btnStartStop, &QPushButton::clicked, this, &MainWindow::onStartStop);
+}
+
+void MainWindow::setupSystemTray()
+{
+    trayIcon = new QSystemTrayIcon(this);
+    
+    // 使用自定义图标
+    trayIcon->setIcon(QIcon(":/icons/logo.ico"));
+    trayIcon->setToolTip("EWP GUI");
+    
+    // 检查系统托盘支持
+    if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+        qWarning() << "System tray is not available";
+        return;
+    }
+    
+    trayMenu = new QMenu(this);
+    
+    auto showAction = trayMenu->addAction("显示主窗口");
+    connect(showAction, &QAction::triggered, this, [this]() {
+        show();
+        raise();
+        activateWindow();
+    });
+    
+    trayMenu->addSeparator();
+    
+    auto startStopAction = trayMenu->addAction("启动/停止");
+    connect(startStopAction, &QAction::triggered, this, &MainWindow::onStartStop);
+    
+    trayMenu->addSeparator();
+    
+    auto quitAction = trayMenu->addAction("退出");
+    connect(quitAction, &QAction::triggered, this, &MainWindow::onQuitApplication);
+    
+    trayIcon->setContextMenu(trayMenu);
+    connect(trayIcon, &QSystemTrayIcon::activated, 
+            this, &MainWindow::onTrayIconActivated);
+    
+    // 只有在系统托盘可用时才显示托盘图标
+    if (QSystemTrayIcon::isSystemTrayAvailable()) {
+        trayIcon->show();
+    }
+}
+
+void MainWindow::setupNodeTable()
+{
+    ui->nodeTable->setColumnCount(5);
+    ui->nodeTable->setHorizontalHeaderLabels({"类型", "地址", "名称", "延迟", "状态"});
+    ui->nodeTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    ui->nodeTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    ui->nodeTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    ui->nodeTable->setAlternatingRowColors(true);
+    ui->nodeTable->horizontalHeader()->setStretchLastSection(true);
+    ui->nodeTable->verticalHeader()->setVisible(false);
+}
+
+void MainWindow::setupMenu()
+{
+    QMenuBar *menuBar = new QMenuBar(this);
+    setMenuBar(menuBar);
+    
+    // 文件菜单
+    QMenu *fileMenu = menuBar->addMenu("文件(&F)");
+    
+    QAction *settingsAction = new QAction("设置(&S)...", this);
+    settingsAction->setShortcut(QKeySequence("Ctrl+,"));
+    connect(settingsAction, &QAction::triggered, this, &MainWindow::onShowSettings);
+    fileMenu->addAction(settingsAction);
+    
+    fileMenu->addSeparator();
+    
+    QAction *quitAction = new QAction("退出(&Q)", this);
+    quitAction->setShortcut(QKeySequence::Quit);
+    connect(quitAction, &QAction::triggered, this, &MainWindow::onQuitApplication);
+    fileMenu->addAction(quitAction);
+    
+    // 帮助菜单
+    QMenu *helpMenu = menuBar->addMenu("帮助(&H)");
+    
+    QAction *aboutAction = new QAction("关于(&A)...", this);
+    connect(aboutAction, &QAction::triggered, this, [this]() {
+        QMessageBox::about(this, "关于 EWP GUI", 
+            "EWP GUI v1.0.0\n\n基于 Qt 的 EWP-Core 图形界面客户端");
+    });
+    helpMenu->addAction(aboutAction);
+}
+
+void MainWindow::onShowSettings()
+{
+    SettingsDialog dialog(this);
+    if (dialog.exec() == QDialog::Accepted) {
+        appendLog("⚙️ 设置已保存");
+        
+        // P2-32: Prompt to restart core if settings changed and core is running
+        if (isRunning) {
+            QMessageBox::StandardButton reply = QMessageBox::question(
+                this,
+                "重启核心进程",
+                "设置已更改。需要重启核心进程以应用新配置。\n\n是否立即重启?",
+                QMessageBox::Yes | QMessageBox::No
+            );
+            
+            if (reply == QMessageBox::Yes) {
+                appendLog("🔄 正在重启核心进程以应用新配置...");
+                
+                // Save current node and tun mode
+                int savedNodeId = currentNodeId;
+                bool savedTunMode = ui->checkTunMode->isChecked();
+                bool savedSystemProxy = ui->checkSystemProxy->isChecked();
+                
+                // Stop current process
+                coreProcess->stop();
+                if (savedSystemProxy) {
+                    systemProxy->disable();
+                }
+                
+                // Wait a bit for clean shutdown
+                QTimer::singleShot(500, this, [this, savedNodeId, savedTunMode, savedSystemProxy]() {
+                    // Restart with same node
+                    auto node = nodeManager->getNode(savedNodeId);
+                    if (node.isValid()) {
+                        if (coreProcess->start(node, savedTunMode)) {
+                            if (savedSystemProxy && !savedTunMode) {
+                                systemProxy->enable(coreProcess->getListenAddr());
+                            }
+                            appendLog("✅ 核心进程已重启");
+                        } else {
+                            appendLog("❌ 重启失败");
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+// P2-31: Proper quit action with confirmation
+void MainWindow::onQuitApplication()
+{
+    if (isRunning) {
+        QMessageBox::StandardButton reply = QMessageBox::question(
+            this,
+            "确认退出",
+            "代理正在运行中。确定要退出吗?",
+            QMessageBox::Yes | QMessageBox::No
+        );
+        
+        if (reply != QMessageBox::Yes) {
+            return;
+        }
+    }
+    
+    // Actually quit the application
+    QApplication::quit();
+}
+
+void MainWindow::updateNodeList()
+{
+    auto nodes = nodeManager->getAllNodes();
+    
+    ui->nodeTable->setRowCount(nodes.size());
+    
+    for (int i = 0; i < nodes.size(); ++i) {
+        const auto &node = nodes[i];
+        
+        ui->nodeTable->setItem(i, 0, new QTableWidgetItem(node.displayType()));
+        ui->nodeTable->setItem(i, 1, new QTableWidgetItem(node.displayAddress()));
+        ui->nodeTable->setItem(i, 2, new QTableWidgetItem(node.name));
+        ui->nodeTable->setItem(i, 3, new QTableWidgetItem(node.displayLatency()));
+        
+        QString status = (node.id == currentNodeId && isRunning) ? "运行中" : "";
+        ui->nodeTable->setItem(i, 4, new QTableWidgetItem(status));
+        
+        // 存储节点 ID
+        ui->nodeTable->item(i, 0)->setData(Qt::UserRole, node.id);
+        
+        // 高亮当前运行的节点
+        if (node.id == currentNodeId && isRunning) {
+            for (int j = 0; j < 5; ++j) {
+                ui->nodeTable->item(i, j)->setBackground(QColor(200, 255, 200));
+            }
+        }
+    }
+    
+    ui->nodeTable->resizeColumnsToContents();
+}
+
+void MainWindow::updateStatusBar()
+{
+    if (isRunning) {
+        auto node = nodeManager->getNode(currentNodeId);
+        ui->labelStatus->setText(QString("运行中: %1 | 监听: %2")
+            .arg(node.name)
+            .arg(coreProcess->getListenAddr()));
+        ui->btnStartStop->setText("停止");
+    } else {
+        ui->labelStatus->setText("未运行");
+        ui->btnStartStop->setText("启动");
+    }
+}
+
+void MainWindow::appendLog(const QString &message)
+{
+    ui->logBrowser->append(message);
+}
+
+void MainWindow::onAddNode()
+{
+    EWPNode node;
+    node.name = "新节点";
+    node.server = "example.com";
+    node.serverPort = 443;
+    node.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    
+    EditNodeDialog dialog(this);
+    dialog.setWindowTitle("添加节点");
+    dialog.setNode(node);
+    
+    if (dialog.exec() == QDialog::Accepted) {
+        EWPNode newNode = dialog.getNode();
+        nodeManager->addNode(newNode);
+        updateNodeList();
+        appendLog(QString("✅ 已添加节点: %1").arg(newNode.name));
+    }
+}
+
+void MainWindow::onEditNode()
+{
+    int row = ui->nodeTable->currentRow();
+    if (row < 0) return;
+    
+    int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+    EWPNode node = nodeManager->getNode(nodeId);
+    
+    EditNodeDialog dialog(this);
+    dialog.setWindowTitle("编辑节点");
+    dialog.setNode(node);
+    
+    if (dialog.exec() == QDialog::Accepted) {
+        EWPNode updatedNode = dialog.getNode();
+        updatedNode.id = nodeId;
+        nodeManager->updateNode(updatedNode);
+        updateNodeList();
+        appendLog(QString("✅ 已更新节点: %1").arg(updatedNode.name));
+    }
+}
+
+void MainWindow::onDeleteNode()
+{
+    int row = ui->nodeTable->currentRow();
+    if (row < 0) return;
+    
+    int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+    
+    if (QMessageBox::question(this, "确认删除", "确定要删除这个节点吗？") 
+        == QMessageBox::Yes) {
+        nodeManager->removeNode(nodeId);
+        updateNodeList();
+    }
+}
+
+void MainWindow::onDuplicateNode()
+{
+    int row = ui->nodeTable->currentRow();
+    if (row < 0) return;
+    
+    int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+    auto node = nodeManager->getNode(nodeId);
+    node.id = -1;
+    node.name += " (副本)";
+    
+    nodeManager->addNode(node);
+    updateNodeList();
+}
+
+void MainWindow::onTestSelected()
+{
+    int row = ui->nodeTable->currentRow();
+    if (row < 0) return;
+    
+    int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+    auto node = nodeManager->getNode(nodeId);
+    
+    appendLog(QString("正在测试节点: %1").arg(node.name));
+    
+    // 异步测试
+    NodeTester::testNode(node, [this, nodeId](int latency) {
+        nodeManager->updateLatency(nodeId, latency);
+        updateNodeList();
+        appendLog(QString("测试完成: %1 ms").arg(latency > 0 ? QString::number(latency) : "失败"));
+    });
+}
+
+void MainWindow::onTestAll()
+{
+    auto nodes = nodeManager->getAllNodes();
+    appendLog(QString("开始测试所有节点 (%1 个)").arg(nodes.size()));
+    
+    for (const auto &node : nodes) {
+        NodeTester::testNode(node, [this, id = node.id](int latency) {
+            nodeManager->updateLatency(id, latency);
+            updateNodeList();
+        });
+    }
+}
+
+void MainWindow::onImportFromClipboard()
+{
+    QString text = QApplication::clipboard()->text();
+    if (text.isEmpty()) {
+        QMessageBox::warning(this, "导入失败", "剪贴板为空");
+        return;
+    }
+    
+    auto nodes = ShareLink::parseLinks(text);
+    if (nodes.isEmpty()) {
+        QMessageBox::warning(this, "导入失败", "未找到有效的分享链接");
+        return;
+    }
+    
+    // P1-21: Confirmation dialog before importing nodes
+    // Build server list for display
+    QStringList serverList;
+    for (const auto &node : nodes) {
+        QString serverInfo = QString("%1:%2 (%3)")
+            .arg(node.server)
+            .arg(node.serverPort)
+            .arg(node.name.isEmpty() ? "未命名" : node.name);
+        serverList.append(serverInfo);
+    }
+    
+    QString message = QString("将导入 %1 个节点:\n\n%2\n\n确认导入?")
+        .arg(nodes.size())
+        .arg(serverList.join("\n"));
+    
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this, 
+        "确认导入", 
+        message,
+        QMessageBox::Yes | QMessageBox::No
+    );
+    
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+    
+    for (auto &node : nodes) {
+        nodeManager->addNode(node);
+    }
+    
+    updateNodeList();
+    QMessageBox::information(this, "导入成功", 
+        QString("成功导入 %1 个节点").arg(nodes.size()));
+}
+
+void MainWindow::onExportToClipboard()
+{
+    int row = ui->nodeTable->currentRow();
+    if (row < 0) {
+        QMessageBox::warning(this, "导出失败", "请先选择一个节点");
+        return;
+    }
+    
+    int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+    auto node = nodeManager->getNode(nodeId);
+    
+    QString link = ShareLink::generateLink(node);
+    QApplication::clipboard()->setText(link);
+    
+    QMessageBox::information(this, "导出成功", "分享链接已复制到剪贴板");
+}
+
+void MainWindow::onStartStop()
+{
+    if (isRunning) {
+        coreProcess->stop();
+        if (ui->checkSystemProxy->isChecked()) {
+            systemProxy->disable();
+        }
+    } else {
+        int row = ui->nodeTable->currentRow();
+        if (row < 0) {
+            QMessageBox::warning(this, "启动失败", "请先选择一个节点");
+            return;
+        }
+        
+        int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+        auto node = nodeManager->getNode(nodeId);
+        
+        if (!node.isValid()) {
+            QMessageBox::warning(this, "启动失败", "节点配置无效");
+            return;
+        }
+        
+        currentNodeId = nodeId;
+        bool tunMode = ui->checkTunMode->isChecked();
+        
+        if (coreProcess->start(node, tunMode)) {
+            if (ui->checkSystemProxy->isChecked() && !tunMode) {
+                systemProxy->enable(coreProcess->getListenAddr());
+            }
+        }
+    }
+    
+    updateNodeList();
+}
+
+void MainWindow::onNodeDoubleClicked(int row, int column)
+{
+    Q_UNUSED(column)
+    
+    int nodeId = ui->nodeTable->item(row, 0)->data(Qt::UserRole).toInt();
+    
+    // 如果双击的是当前运行的节点，则停止
+    if (isRunning && nodeId == currentNodeId) {
+        onStartStop();
+        return;
+    }
+    
+    // 如果正在运行其他节点，先停止再切换（isRunning 由 stopped 信号更新）
+    if (isRunning) {
+        appendLog("🔄 切换节点...");
+        coreProcess->stop();
+        if (ui->checkSystemProxy->isChecked()) {
+            systemProxy->disable();
+        }
+    }
+    
+    // 启动新节点
+    currentNodeId = nodeId;
+    auto node = nodeManager->getNode(nodeId);
+    
+    if (!node.isValid()) {
+        QMessageBox::warning(this, "启动失败", "节点配置无效");
+        return;
+    }
+    
+    bool tunMode = ui->checkTunMode->isChecked();
+    
+    if (coreProcess->start(node, tunMode)) {
+        if (ui->checkSystemProxy->isChecked() && !tunMode) {
+            systemProxy->enable(coreProcess->getListenAddr());
+        }
+    }
+    
+    updateNodeList();
+}
+
+void MainWindow::onSystemProxyToggled(bool checked)
+{
+    if (isRunning && !ui->checkTunMode->isChecked()) {
+        // 禁用按钮防止重复点击
+        ui->checkSystemProxy->setEnabled(false);
+        
+        if (checked) {
+            systemProxy->enable(coreProcess->getListenAddr());
+            appendLog("✅ 系统代理已启用");
+        } else {
+            systemProxy->disable();
+            appendLog("⏹️ 系统代理已禁用");
+        }
+        
+        // 重新启用按钮
+        ui->checkSystemProxy->setEnabled(true);
+    }
+}
+
+void MainWindow::onTunModeToggled(bool checked)
+{
+    if (checked) {
+        ui->checkSystemProxy->setEnabled(false);
+        ui->checkSystemProxy->setChecked(false);
+    } else {
+        ui->checkSystemProxy->setEnabled(true);
+    }
+}
+
+void MainWindow::showNodeContextMenu(const QPoint &pos)
+{
+    QMenu menu(this);
+    
+    menu.addAction("添加节点", this, &MainWindow::onAddNode);
+    
+    if (ui->nodeTable->currentRow() >= 0) {
+        menu.addAction("编辑节点", this, &MainWindow::onEditNode);
+        menu.addAction("删除节点", this, &MainWindow::onDeleteNode);
+        menu.addAction("复制节点", this, &MainWindow::onDuplicateNode);
+        menu.addSeparator();
+        menu.addAction("测试延迟", this, &MainWindow::onTestSelected);
+        menu.addSeparator();
+        menu.addAction("复制分享链接", this, &MainWindow::onExportToClipboard);
+    }
+    
+    menu.exec(ui->nodeTable->mapToGlobal(pos));
+}
+
+void MainWindow::onTrayIconActivated(QSystemTrayIcon::ActivationReason reason)
+{
+    if (reason == QSystemTrayIcon::DoubleClick) {
+        show();
+        raise();
+        activateWindow();
+    }
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    // 检查系统托盘是否可用
+    if (trayIcon && QSystemTrayIcon::isSystemTrayAvailable() && trayIcon->isVisible()) {
+        hide();
+        trayIcon->showMessage("EWP GUI", "程序已最小化到系统托盘", 
+            QSystemTrayIcon::Information, 2000);
+        event->ignore();
+    } else {
+        // 没有托盘支持时直接退出
+        event->accept();
+    }
+}
+
+void MainWindow::loadSettings()
+{
+    QSettings settings("EWP", "EWP-GUI");
+    
+    restoreGeometry(settings.value("geometry").toByteArray());
+    restoreState(settings.value("windowState").toByteArray());
+    
+    ui->checkSystemProxy->setChecked(settings.value("systemProxy", false).toBool());
+    ui->checkTunMode->setChecked(settings.value("tunMode", false).toBool());
+}
+
+void MainWindow::saveSettings()
+{
+    QSettings settings("EWP", "EWP-GUI");
+    
+    settings.setValue("geometry", saveGeometry());
+    settings.setValue("windowState", saveState());
+    settings.setValue("systemProxy", ui->checkSystemProxy->isChecked());
+    settings.setValue("tunMode", ui->checkTunMode->isChecked());
+}
