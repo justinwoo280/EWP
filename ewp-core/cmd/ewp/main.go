@@ -24,6 +24,7 @@ import (
 	"ewp-core/log"
 	"ewp-core/outbound/direct"
 	"ewp-core/outbound/ewpclient"
+	"ewp-core/tun/bypass"
 	"ewp-core/transport"
 )
 
@@ -87,9 +88,26 @@ func main() {
 			len(conf.ServerNameDNS.DoH.Servers))
 	}
 
-	// Collect ewpclient outbounds so we can re-arm their transports
-	// once a TUN inbound delivers the bypass dialer (see onBypass
-	// below). Server-side direct outbounds don't care.
+	// Process-wide bypass dialer.  Probe the kernel routing table BEFORE
+	// any TUN inbound is built — once TUN takes the default route the
+	// probe would just point right back at the TUN device.  We attach the
+	// resulting dialer to clientResolver and (later) every ewpclient
+	// transport, so the EWP control channel and DoH always egress the
+	// physical interface, regardless of whether the user actually
+	// configured a TUN inbound or not.
+	earlyBypass, bypassErr := bypass.NewBypassDialer("")
+	if bypassErr != nil {
+		log.Printf("[ewp] bypass dialer probe failed: %v (DoH/control-plane will use OS routing)", bypassErr)
+	} else if clientResolver != nil {
+		clientResolver.SetDialer(earlyBypass.Dialer)
+		log.Printf("[ewp] early bypass: client DoH dialer bound to physical egress interface")
+	}
+
+	// Collect ewpclient outbounds so we can apply the early bypass dialer
+	// to each transport once they're built. The TUN-driven onBypass
+	// callback below stays as a safety net (e.g. when the route changes
+	// after startup), but we no longer rely on it for first-packet
+	// correctness.
 	var ewpClients []*ewpclient.Outbound
 	for _, oc := range conf.Outbounds {
 		out, err := cfg.BuildOutbound(oc, conf.ECH.BootstrapDoH.Servers, clientResolver)
@@ -105,6 +123,9 @@ func main() {
 		}
 		if ec, ok := out.(*ewpclient.Outbound); ok {
 			ewpClients = append(ewpClients, ec)
+			if earlyBypass != nil {
+				ec.Transport().SetBypassConfig(earlyBypass.ToBypassConfig(conf.ECH.BootstrapDoH.Servers))
+			}
 		}
 		if err := eng.AddOutbound(out); err != nil {
 			fmt.Fprintf(os.Stderr, "AddOutbound %q: %v\n", oc.Tag, err)
