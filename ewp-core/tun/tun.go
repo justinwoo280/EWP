@@ -1,5 +1,20 @@
 package tun
 
+// Package tun is the v2 TUN inbound. As of P0/sing-tun migration this
+// file is a thin wrapper around sing-tun:
+//
+//   - sing-tun creates the OS device (wintun on Windows, /dev/net/tun
+//     on Linux, utun on Darwin) and installs the routing table entries.
+//   - sing-tun's stack ("system" by default, "gvisor" optional) demuxes
+//     IP packets into per-flow TCP/UDP and hands them to our
+//     singHandler, which forwards into the existing v2 dispatcher
+//     (handler.go + tun_socket.go).
+//
+// Everything we previously hand-rolled (wgtun device, custom gVisor
+// glue, per-OS netsh / iproute2 setup, bypass dialer probe) is gone --
+// sing-tun owns the OS layer and provides DefaultInterfaceMonitor for
+// out-of-TUN bypass without us juggling control.Func chains.
+
 import (
 	"context"
 	"fmt"
@@ -7,207 +22,291 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing/common/control"
+	"github.com/sagernet/sing/common/logger"
+
 	"ewp-core/dns"
 	"ewp-core/log"
-	"ewp-core/transport"
-	ewpbypass "ewp-core/tun/bypass"
-	ewpgvisor "ewp-core/tun/gvisor"
-	tunsetup "ewp-core/tun/setup"
-
-	tun "golang.zx2c4.com/wireguard/tun"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 )
 
-// Config holds parameters for constructing a v2 TUN inbound.
-//
-// In v2 the TUN owns no transport. Outbounds are reached via the
-// engine, which is bound after construction with Handler.BindEngine.
+// Config holds parameters for constructing a v2 TUN inbound.  In v2
+// the TUN owns no transport: outbounds are reached via the engine,
+// which is bound after construction via Handler.BindEngine.
 type Config struct {
-	IP      string
-	DNS     string
-	IPv6    string
-	IPv6DNS string
-	MTU     int
-	Stack   string
+	// IPv4 address in CIDR form, e.g. "10.233.0.2/24".
+	IP string
+	// IPv6 address in CIDR form, e.g. "fd00:5ca1:e::2/64".  Optional.
+	IPv6 string
+	// MTU in bytes; 0 falls back to 1500.
+	MTU int
+	// Stack is one of "system" (default) or "gvisor".
+	Stack string
 
-	// ServerAddr is the upstream EWP server's host:port. Used at
-	// Setup() time to probe the physical outbound interface and
-	// build a BypassConfig — without it, the OS routing table will
-	// loop the outbound's connections back through the TUN itself.
-	ServerAddr string
+	// Inet4DNS / Inet6DNS are the in-TUN DNS server IPs reported to
+	// the OS via the TUN interface options.  Apps inside the TUN
+	// will see these as their resolvers.  When FakeIP is enabled
+	// those queries get short-circuited inside Handler.HandleUDP.
+	Inet4DNS string
+	Inet6DNS string
 
-	// BypassDoHServers seed the bypass resolver. Optional.
-	BypassDoHServers []string
-
-	// OnBypass, if non-nil, is invoked at Setup() with the resolved
-	// BypassConfig so the caller can install it on the outbound
-	// transport (e.g. ewpclient.SetBypassConfig). The TUN itself no
-	// longer manages the transport.
-	OnBypass func(*transport.BypassConfig)
+	// FileDescriptor adopts an existing TUN device instead of
+	// asking sing-tun to create one. Used by ewpmobile on Android
+	// where Java's VpnService gives us the fd. When non-zero,
+	// sing-tun skips device creation AND OS routing setup (the
+	// Android system handles routing via VpnService.Builder).
+	FileDescriptor int
 }
 
+// TUN is the v2 inbound device.  Created by New(); started by Start().
 type TUN struct {
-	device    tun.Device
-	stack     *ewpgvisor.Stack
-	handler   *Handler
+	device  tun.Tun
+	stack   tun.Stack
+	handler *Handler
+
+	monitor       tun.DefaultInterfaceMonitor
+	networkMon    tun.NetworkUpdateMonitor
+	interfaceFind control.InterfaceFinder
+
 	fakePool  *dns.FakeIPPool
 	config    *Config
 	ctx       context.Context
 	cancel    context.CancelFunc
-	ifName    string    // actual OS interface name returned by tun.Device.Name()
-	closeOnce sync.Once // ensures Close() is idempotent
+	closeOnce sync.Once
 }
 
-// FakeIPPool returns the FakeIP pool owned by this TUN. Used by the
+// FakeIPPool returns the FakeIP pool owned by this TUN.  Used by the
 // inbound binder to inject the same pool into the engine's DNS path.
-// Returns nil if the TUN has no FakeIP enabled (currently always non-nil).
 func (t *TUN) FakeIPPool() *dns.FakeIPPool { return t.fakePool }
 
+// InterfaceMonitor returns sing-tun's monitor so the rest of v2 can
+// register dialer Control funcs that bind sockets to the current
+// physical default interface.  Returns nil before Start().
+func (t *TUN) InterfaceMonitor() tun.DefaultInterfaceMonitor { return t.monitor }
+
+// InterfaceFinder returns the same finder used by the monitor so that
+// control.BindToInterface can resolve interface index -> name without
+// re-walking the kernel table.
+func (t *TUN) InterfaceFinder() control.InterfaceFinder { return t.interfaceFind }
+
+// New constructs a TUN device + stack but does NOT install routes
+// yet.  Call Start() to bring the device up and let sing-tun install
+// the routing table entries.
 func New(cfg *Config) (*TUN, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	handler := NewHandler(ctx)
-
-	// Initialize FakeIP pool for instant DNS responses (< 1ms, no tunnel needed)
-	fakeIPPool := dns.NewFakeIPPool()
-	handler.SetFakeIPPool(fakeIPPool)
-	log.Printf("[TUN] FakeIP DNS enabled (IPv4: 198.18.0.0/15, IPv6: fc00::/112)")
 
 	mtu := uint32(cfg.MTU)
 	if mtu == 0 {
 		mtu = 1500
 	}
 
-	ipStr := cfg.IP
-	if !strings.Contains(ipStr, "/") {
-		ipStr += "/24"
-	}
-	_, err := netip.ParsePrefix(ipStr)
+	v4Prefix, err := parseCIDRWith(cfg.IP, "/24")
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("parse IPv4 address failed: %w", err)
+		return nil, fmt.Errorf("parse IPv4 address: %w", err)
+	}
+	prefixes := []netip.Prefix{v4Prefix}
+
+	var v6Prefixes []netip.Prefix
+	if cfg.IPv6 != "" {
+		v6Prefix, err := parseCIDRWith(cfg.IPv6, "/64")
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("parse IPv6 address: %w", err)
+		}
+		v6Prefixes = []netip.Prefix{v6Prefix}
 	}
 
-	tunDevice, err := tun.CreateTUN("ewp-tun", int(mtu))
+	dnsAddrs := make([]netip.Addr, 0, 2)
+	if cfg.Inet4DNS != "" {
+		if a, err := netip.ParseAddr(cfg.Inet4DNS); err == nil {
+			dnsAddrs = append(dnsAddrs, a)
+		}
+	}
+	if cfg.Inet6DNS != "" {
+		if a, err := netip.ParseAddr(cfg.Inet6DNS); err == nil {
+			dnsAddrs = append(dnsAddrs, a)
+		}
+	}
+
+	// FakeIP pool is always installed in v2 (sub-ms DNS, no tunnel
+	// for queries).  Apps that disable FakeIP route DNS through the
+	// engine like any other UDP, where the server-side resolver
+	// handles them.
+	fakeIPPool := dns.NewFakeIPPool()
+	handler := NewHandler(ctx)
+	handler.SetFakeIPPool(fakeIPPool)
+	log.Printf("[TUN] FakeIP pool initialised (IPv4 198.18/15, IPv6 fc00::/112)")
+
+	// sing-tun NetworkUpdateMonitor watches the kernel for routing
+	// changes; the DefaultInterfaceMonitor uses it to expose the
+	// current physical default interface.  Once the TUN is up, the
+	// monitor automatically excludes the TUN device itself, which
+	// is exactly what we need to bind out-of-TUN sockets.
+	netMon, err := tun.NewNetworkUpdateMonitor(stubLogger{})
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("create TUN device failed: %w", err)
+		return nil, fmt.Errorf("create network monitor: %w", err)
 	}
-
-	stackConfig := &ewpgvisor.StackConfig{
-		MTU:        int(mtu),
-		TCPHandler: handler.HandleTCP,
-		UDPHandler: func(conn *gonet.UDPConn, payload []byte, src netip.AddrPort, dst netip.AddrPort) {
-			handler.HandleUDP(conn, payload, src, dst)
-		},
-	}
-
-	stack, err := ewpgvisor.NewStack(tunDevice, stackConfig)
+	ifaceMon, err := tun.NewDefaultInterfaceMonitor(netMon, stubLogger{}, tun.DefaultInterfaceMonitorOptions{})
 	if err != nil {
-		tunDevice.Close()
+		_ = netMon.Close()
 		cancel()
-		return nil, fmt.Errorf("create gvisor stack failed: %w", err)
+		return nil, fmt.Errorf("create interface monitor: %w", err)
+	}
+	finder := control.NewDefaultInterfaceFinder()
+
+	// AutoRoute is OFF when an external fd is supplied: in that
+	// scenario the OS (Android VpnService) already installed the
+	// routes, and asking sing-tun to do it again will fail with
+	// "operation not permitted" because the unprivileged app
+	// can't manipulate the kernel routing table directly.
+	autoRoute := cfg.FileDescriptor == 0
+	tunOpts := tun.Options{
+		Name:             "ewp-tun",
+		Inet4Address:     prefixes,
+		Inet6Address:     v6Prefixes,
+		MTU:              mtu,
+		AutoRoute:        autoRoute,
+		StrictRoute:      false,
+		DNSServers:       dnsAddrs,
+		FileDescriptor:   cfg.FileDescriptor,
+		InterfaceFinder:  finder,
+		InterfaceMonitor: ifaceMon,
+		Logger:           stubLogger{},
+	}
+
+	dev, err := tun.New(tunOpts)
+	if err != nil {
+		_ = ifaceMon.Close()
+		_ = netMon.Close()
+		cancel()
+		return nil, fmt.Errorf("create TUN device: %w", err)
+	}
+
+	stackName := cfg.Stack
+	if stackName == "" {
+		stackName = "system"
+	}
+	st, err := tun.NewStack(stackName, tun.StackOptions{
+		Context:                ctx,
+		Tun:                    dev,
+		TunOptions:             tunOpts,
+		Handler:                newSingHandler(handler),
+		Logger:                 stubLogger{},
+		ForwarderBindInterface: true,
+		IncludeAllNetworks:     false,
+		InterfaceFinder:        finder,
+	})
+	if err != nil {
+		_ = dev.Close()
+		_ = ifaceMon.Close()
+		_ = netMon.Close()
+		cancel()
+		return nil, fmt.Errorf("create stack %q: %w", stackName, err)
 	}
 
 	return &TUN{
-		device:   tunDevice,
-		stack:    stack,
-		handler:  handler,
-		fakePool: fakeIPPool,
-		config:   cfg,
-		ctx:      ctx,
-		cancel:   cancel,
+		device:        dev,
+		stack:         st,
+		handler:       handler,
+		monitor:       ifaceMon,
+		networkMon:    netMon,
+		interfaceFind: finder,
+		fakePool:      fakeIPPool,
+		config:        cfg,
+		ctx:           ctx,
+		cancel:        cancel,
 	}, nil
 }
 
-// Setup configures the OS network interface and routing table, then injects
-// a bypass dialer into the transport so proxy connections don't loop through
-// the TUN device.
-//
-// MUST be called after New() and BEFORE Start(). The bypass dialer is created
-// first (while the physical default route is still in place), then the TUN
-// routes are added — this ordering is critical to correctly identify the
-// physical outbound interface.
-func (t *TUN) Setup() error {
-	ifName, err := t.device.Name()
-	if err != nil {
-		return fmt.Errorf("get TUN interface name: %w", err)
-	}
-	t.ifName = ifName
-	log.Printf("[TUN] Interface name: %s", ifName)
-
-	// Step 1 — bypass dialer BEFORE route changes.
-	// NewBypassDialer probes the current routing table (UDP connect to server IP)
-	// to detect the physical outbound interface. This must happen before we add
-	// the TUN default route, otherwise the probe would pick the TUN itself.
-	if t.config.ServerAddr != "" {
-		bd, err := ewpbypass.NewBypassDialer(t.config.ServerAddr)
-		if err != nil {
-			log.Printf("[TUN] Warning: bypass dialer init failed: %v (routing loop risk)", err)
-		} else {
-			bcfg := bd.ToBypassConfig(t.config.BypassDoHServers)
-			if t.config.OnBypass != nil {
-				t.config.OnBypass(bcfg)
-			}
-			log.Printf("[TUN] Bypass dialer active on interface %s", ifName)
-		}
-	} else {
-		log.Printf("[TUN] Warning: ServerAddr not set — bypass dialer disabled, routing loop possible")
-	}
-
-	// Step 2 — assign IP address and add default routes through the TUN.
-	mtu := t.config.MTU
-	if mtu <= 0 {
-		mtu = 1500
-	}
-	if err := tunsetup.SetupTUN(ifName, t.config.IP, t.config.IPv6, t.config.DNS, t.config.IPv6DNS, mtu); err != nil {
-		return fmt.Errorf("configure TUN network: %w", err)
-	}
-
-	log.Printf("[TUN] Network configured: interface=%s IPv4=%s IPv6=%s MTU=%d",
-		ifName, t.config.IP, t.config.IPv6, mtu)
-	return nil
-}
-
+// Start brings the TUN device online and installs OS routing rules.
+// Blocks until ctx (passed at New) is cancelled.
 func (t *TUN) Start() error {
-	log.Printf("[TUN] TUN mode started (stack=%s)", t.config.Stack)
-	log.Printf("[TUN] IPv4: %s", t.config.IP)
-	if t.config.IPv6 != "" {
-		log.Printf("[TUN] IPv6: %s", t.config.IPv6)
+	if err := t.networkMon.Start(); err != nil {
+		return fmt.Errorf("start network monitor: %w", err)
 	}
-	log.Printf("[TUN] DNS: IPv4=%s, IPv6=%s", t.config.DNS, t.config.IPv6DNS)
-
+	if err := t.monitor.Start(); err != nil {
+		return fmt.Errorf("start interface monitor: %w", err)
+	}
+	if err := t.stack.Start(); err != nil {
+		return fmt.Errorf("start stack: %w", err)
+	}
+	log.Printf("[TUN] started: stack=%s ipv4=%s ipv6=%s mtu=%d",
+		stackName(t.config.Stack), t.config.IP, t.config.IPv6, t.MTU())
 	<-t.ctx.Done()
 	return nil
 }
 
-func (t *TUN) Close() error {
-	var closeErr error
-	t.closeOnce.Do(func() {
-		log.Printf("[TUN] Stopping TUN mode...")
-
-		if t.cancel != nil {
-			t.cancel()
-		}
-
-		if t.stack != nil {
-			t.stack.Close()
-		}
-
-		// Close the underlying TUN device (releases Wintun handle on Windows,
-		// fd on Linux/macOS). Must come after stack.Close() so gVisor stops
-		// reading from the device before we destroy it.
-		if t.device != nil {
-			t.device.Close()
-		}
-
-		if t.ifName != "" {
-			if err := tunsetup.TeardownTUN(t.ifName); err != nil {
-				log.Printf("[TUN] Teardown warning: %v", err)
-			}
-		}
-
-		log.Printf("[TUN] TUN mode stopped")
-	})
-	return closeErr
+// MTU returns the configured MTU (or 1500 default).
+func (t *TUN) MTU() uint32 {
+	if t.config.MTU > 0 {
+		return uint32(t.config.MTU)
+	}
+	return 1500
 }
+
+// Close tears the device down and unwinds the OS routing changes.
+// Idempotent.
+func (t *TUN) Close() error {
+	t.closeOnce.Do(func() {
+		log.Printf("[TUN] stopping")
+		t.cancel()
+		if t.stack != nil {
+			_ = t.stack.Close()
+		}
+		if t.device != nil {
+			_ = t.device.Close()
+		}
+		if t.monitor != nil {
+			_ = t.monitor.Close()
+		}
+		if t.networkMon != nil {
+			_ = t.networkMon.Close()
+		}
+		t.handler.Close()
+	})
+	return nil
+}
+
+// parseCIDRWith parses raw as a CIDR; if no `/` is present, applyDefault
+// is appended (e.g. "/24" or "/64").
+func parseCIDRWith(raw, applyDefault string) (netip.Prefix, error) {
+	if raw == "" {
+		return netip.Prefix{}, fmt.Errorf("empty address")
+	}
+	if !strings.Contains(raw, "/") {
+		raw += applyDefault
+	}
+	return netip.ParsePrefix(raw)
+}
+
+func stackName(s string) string {
+	if s == "" {
+		return "system"
+	}
+	return s
+}
+
+// stubLogger is a minimal logger.Logger that forwards everything to
+// our package logger.  sing-tun's logging is verbose by design; we
+// downgrade most of it to V (verbose) so production logs stay clean.
+type stubLogger struct{}
+
+func (stubLogger) Trace(args ...any)                                  { log.V("[sing-tun] %v", args) }
+func (stubLogger) Debug(args ...any)                                  { log.V("[sing-tun] %v", args) }
+func (stubLogger) Info(args ...any)                                   { log.Printf("[sing-tun] %v", args) }
+func (stubLogger) Warn(args ...any)                                   { log.Printf("[sing-tun] WARN %v", args) }
+func (stubLogger) Error(args ...any)                                  { log.Printf("[sing-tun] ERR %v", args) }
+func (stubLogger) Fatal(args ...any)                                  { log.Printf("[sing-tun] FATAL %v", args) }
+func (stubLogger) Panic(args ...any)                                  { log.Printf("[sing-tun] PANIC %v", args) }
+func (stubLogger) TraceContext(_ context.Context, args ...any)        { log.V("[sing-tun] %v", args) }
+func (stubLogger) DebugContext(_ context.Context, args ...any)        { log.V("[sing-tun] %v", args) }
+func (stubLogger) InfoContext(_ context.Context, args ...any)         { log.Printf("[sing-tun] %v", args) }
+func (stubLogger) WarnContext(_ context.Context, args ...any)         { log.Printf("[sing-tun] WARN %v", args) }
+func (stubLogger) ErrorContext(_ context.Context, args ...any)        { log.Printf("[sing-tun] ERR %v", args) }
+func (stubLogger) FatalContext(_ context.Context, args ...any)        { log.Printf("[sing-tun] FATAL %v", args) }
+func (stubLogger) PanicContext(_ context.Context, args ...any)        { log.Printf("[sing-tun] PANIC %v", args) }
+
+// compile-time check that stubLogger satisfies sing's logger.Logger.
+var _ logger.ContextLogger = stubLogger{}

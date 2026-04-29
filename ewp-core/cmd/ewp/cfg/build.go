@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	neturl "net/url"
+	"os"
 
 	"ewp-core/common/clientdns"
 	commontls "ewp-core/common/tls"
@@ -23,13 +24,7 @@ import (
 // BuildInbound returns the engine.Inbound for the given config block.
 //
 // Supported types: "tun", "socks5", "http", "ewpserver".
-//
-// "tun" is intentionally NOT wired here in commit 7 because
-// tun.Config still depends on a per-platform setup. The CLI exits
-// with a clear error if a tun inbound is configured; bring up TUN
-// out-of-process or wait for the upcoming tun.AsInbound bootstrap
-// improvements.
-func BuildInbound(c InboundCfg, onBypass BypassSink) (engine.Inbound, error) {
+func BuildInbound(c InboundCfg) (engine.Inbound, error) {
 	switch c.Type {
 	case "socks5":
 		if c.Listen == "" {
@@ -47,7 +42,7 @@ func BuildInbound(c InboundCfg, onBypass BypassSink) (engine.Inbound, error) {
 		return buildEWPServerInbound(c)
 
 	case "tun":
-		return buildTUNInbound(c, onBypass)
+		return buildTUNInbound(c)
 
 	default:
 		return nil, fmt.Errorf("unknown inbound type %q", c.Type)
@@ -55,13 +50,13 @@ func BuildInbound(c InboundCfg, onBypass BypassSink) (engine.Inbound, error) {
 }
 
 // BuildServerNameResolver constructs a *clientdns.Resolver from the
-// cfg.ServerNameDNS block. Returns (nil, nil) if no DoH servers are
-// configured — callers can pass the result straight to BuildOutbound,
-// which treats nil as "use OS resolver".
-func BuildServerNameResolver(c ServerNameDNSCfg) (*clientdns.Resolver, error) {
+// client.doh block. The returned resolver is shared by every
+// ewpclient outbound to translate the upstream EWP server's domain
+// to an IP at Dial time, AND by buildClientTransport's ECHManager
+// for HTTPS-RR fetch.  A single client-side DoH list does both jobs.
+func BuildServerNameResolver(c ClientCfg) (*clientdns.Resolver, error) {
 	return clientdns.New(clientdns.Config{
-		Servers:    c.DoH.Servers,
-		PreferIPv6: c.PreferIPv6,
+		Servers: c.DoH.Servers,
 	})
 }
 
@@ -143,6 +138,18 @@ func buildClientTransport(c TransportCfg, echBootstrap []string, resolver *clien
 			echMgr = commontls.NewECHManager(echDomain, echBootstrap...)
 		} else {
 			echMgr = commontls.NewECHManager(echDomain)
+		}
+		// Synchronously prefetch the HTTPS RR NOW, before any inbound
+		// (notably TUN) gets a chance to take over the routing table.
+		// V1 did this and never had the "wireshark sees zero TLS
+		// ClientHellos" problem -- v2's lazy Get() in transport.Dial()
+		// races the TUN setup and triggers the loop. Refresh() failure
+		// is non-fatal: the manager will retry on first use, but the
+		// user is informed via stderr immediately rather than getting
+		// silent EOFs minutes later.
+		if err := echMgr.Refresh(); err != nil {
+			fmt.Fprintf(os.Stderr, "ECH bootstrap warning: %v "+
+				"(will retry lazily; if TUN is enabled this is likely to deadlock)\n", err)
 		}
 	}
 

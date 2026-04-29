@@ -69,16 +69,10 @@ QJsonArray ConfigGenerator::generateInbounds(const EWPNode &node,
         if (!dns.isEmpty()) tun["dns"] = dns;
         tun["mtu"]      = settings.tunMTU;
         tun["fake_ip"]  = true;
-        // bypass_server: derived from the chosen node so the TUN
-        // setup probe knows which physical interface to mark for
-        // outbound traffic before installing its default route.
-        // Without this the proxy's own dial would route-loop back
-        // through the TUN. host or host:port both accepted.
-        if (!node.server.isEmpty()) {
-            QString bs = node.server;
-            if (node.serverPort > 0) bs += ":" + QString::number(node.serverPort);
-            tun["bypass_server"] = bs;
-        }
+        // No bypass_server emission anymore: sing-tun's
+        // DefaultInterfaceMonitor watches kernel routing in real
+        // time and dialer Control funcs always bind to the current
+        // physical egress NIC, so no startup-time hint is needed.
         in["tun"] = tun;
     } else {
         in["tag"]    = "local-socks";

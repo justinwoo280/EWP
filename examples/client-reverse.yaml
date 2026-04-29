@@ -36,9 +36,9 @@ outbounds:
 router:
   default: my-vps
 
-# server_name_dns is still useful here — it resolves "10.0.0.5" via
-# DoH if you wrote a DNS name there, even when the TLS layer is
-# absent. For raw-IP urls like above it has nothing to do.
+# client.doh is still useful here when transport.url uses a hostname
+# instead of a literal IP — we resolve it via DoH before dialing.
+# For raw-IP urls like above it has no effect.
 client:
   doh:
     servers:

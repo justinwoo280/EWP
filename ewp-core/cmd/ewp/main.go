@@ -23,9 +23,6 @@ import (
 	"ewp-core/inbound/ewpserver"
 	"ewp-core/log"
 	"ewp-core/outbound/direct"
-	"ewp-core/outbound/ewpclient"
-	"ewp-core/tun/bypass"
-	"ewp-core/transport"
 )
 
 // hasAnyEWPServerInbound reports whether any inbound is an ewpserver
@@ -78,39 +75,23 @@ func main() {
 	// into an IP at Dial time. Independent of serverResolver and
 	// echBootstrap. Returns nil if user did not configure
 	// `client_dns:`, in which case the OS resolver is used.
-	clientResolver, err := cfg.BuildServerNameResolver(conf.ServerNameDNS)
+	clientResolver, err := cfg.BuildServerNameResolver(conf.Client)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "server_name_dns: %v\n", err)
+		fmt.Fprintf(os.Stderr, "client.doh: %v\n", err)
 		os.Exit(2)
 	}
 	if clientResolver != nil {
-		log.Printf("[ewp] server-name DNS resolver: %d DoH upstream(s) for upstream-server lookup",
-			len(conf.ServerNameDNS.DoH.Servers))
+		log.Printf("[ewp] client DoH resolver: %d upstream(s) (used for both server-name lookup and ECH bootstrap)",
+			len(conf.Client.DoH.Servers))
 	}
 
-	// Process-wide bypass dialer.  Probe the kernel routing table BEFORE
-	// any TUN inbound is built — once TUN takes the default route the
-	// probe would just point right back at the TUN device.  We attach the
-	// resulting dialer to clientResolver and (later) every ewpclient
-	// transport, so the EWP control channel and DoH always egress the
-	// physical interface, regardless of whether the user actually
-	// configured a TUN inbound or not.
-	earlyBypass, bypassErr := bypass.NewBypassDialer("")
-	if bypassErr != nil {
-		log.Printf("[ewp] bypass dialer probe failed: %v (DoH/control-plane will use OS routing)", bypassErr)
-	} else if clientResolver != nil {
-		clientResolver.SetDialer(earlyBypass.Dialer)
-		log.Printf("[ewp] early bypass: client DoH dialer bound to physical egress interface")
-	}
-
-	// Collect ewpclient outbounds so we can apply the early bypass dialer
-	// to each transport once they're built. The TUN-driven onBypass
-	// callback below stays as a safety net (e.g. when the route changes
-	// after startup), but we no longer rely on it for first-packet
-	// correctness.
-	var ewpClients []*ewpclient.Outbound
+	// Build outbounds.  No bypass-dialer juggling required anymore:
+	// sing-tun's DefaultInterfaceMonitor (created by the TUN inbound,
+	// if any) automatically excludes the TUN device when reporting
+	// the default physical interface, so dialer Control funcs can
+	// always bind to the right NIC without us caring about ordering.
 	for _, oc := range conf.Outbounds {
-		out, err := cfg.BuildOutbound(oc, conf.ECH.BootstrapDoH.Servers, clientResolver)
+		out, err := cfg.BuildOutbound(oc, conf.Client.DoH.Servers, clientResolver)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "outbound %q: %v\n", oc.Tag, err)
 			os.Exit(2)
@@ -119,12 +100,6 @@ func main() {
 			if d, ok := out.(*direct.Outbound); ok {
 				d.SetResolver(serverResolver)
 				log.Printf("[ewp] outbound %q: AsyncResolver attached", oc.Tag)
-			}
-		}
-		if ec, ok := out.(*ewpclient.Outbound); ok {
-			ewpClients = append(ewpClients, ec)
-			if earlyBypass != nil {
-				ec.Transport().SetBypassConfig(earlyBypass.ToBypassConfig(conf.ECH.BootstrapDoH.Servers))
 			}
 		}
 		if err := eng.AddOutbound(out); err != nil {
@@ -159,32 +134,8 @@ func main() {
 		}
 	}
 
-	// onBypass is invoked once when a TUN inbound discovers the
-	// physical egress interface. We re-arm:
-	//   1) the client-side DoH resolver (so DoH dials don't loop
-	//      through the TUN we just installed)
-	//   2) every ewpclient outbound's transport (so the EWP control
-	//      channel itself dials around the TUN)
-	// Without (1) Wireshark on the physical NIC sees zero TLS
-	// ClientHellos and the whole client hangs at first DNS lookup.
-	onBypass := func(b *transport.BypassConfig) {
-		if b == nil {
-			return
-		}
-		log.Printf("[ewp] bypass dialer received from TUN: re-arming client DoH + outbound transports")
-		if clientResolver != nil {
-			// b.TCPDialer is the *net.Dialer bound to the physical
-			// outbound interface; clientdns.Resolver swaps its
-			// MultiClient to use it.
-			clientResolver.SetDialer(b.TCPDialer)
-		}
-		for _, ec := range ewpClients {
-			ec.Transport().SetBypassConfig(b)
-		}
-	}
-
 	for _, ic := range conf.Inbounds {
-		in, err := cfg.BuildInbound(ic, onBypass)
+		in, err := cfg.BuildInbound(ic)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "inbound %q: %v\n", ic.Tag, err)
 			os.Exit(2)

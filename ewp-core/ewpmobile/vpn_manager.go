@@ -159,38 +159,27 @@ func (vm *vpnManager) Start(tunFD int, cfg *VPNConfig) error {
 	}
 	vm.eng = eng
 
-	// 6. TUN inbound bound to the Android-provided fd.
+	// 6. TUN inbound bound to the Android-provided fd. We hand the
+	// fd straight to sing-tun via tun.Config.FileDescriptor; sing-tun
+	// then skips both device creation and OS routing setup
+	// (VpnService.Builder on the Java side already installed routes
+	// before handing the fd over).  The DefaultInterfaceMonitor
+	// inside tun.New still runs and lets dialer Control funcs bind
+	// out-of-TUN sockets to the current physical NIC — no
+	// SetBypassConfig / SocketProtector wiring needed.
 	tunCfg := &tun.Config{
-		IP:               firstNonEmpty(cfg.TUNIPv4, "10.233.0.2"),
-		DNS:              firstNonEmpty(cfg.DNSv4, "10.233.0.1"),
-		IPv6:             cfg.TUNIPv6,
-		IPv6DNS:          cfg.DNSv6,
-		MTU:              firstPositive(cfg.TUNMTU, 1420),
-		Stack:            "gvisor",
-		ServerAddr:       cfg.ServerAddr,
-		BypassDoHServers: dohServers,
-		OnBypass: func(b *transport.BypassConfig) {
-			// On Android we wrap the bypass dialer's syscall.Control
-			// hook so each TCP connect / UDP listen we make goes
-			// through VpnService.protect(fd). Without this the
-			// outbound's own packets get re-captured by the TUN
-			// device and we hit infinite recursion + battery drain.
-			//
-			// The hook is best-effort: if no SocketProtector has
-			// been registered (Kotlin side hasn't called
-			// SetSocketProtector yet), we keep the unprotected
-			// dialer rather than fail closed — letting the user at
-			// least see the routing-loop log line.
-			if IsSocketProtectorSet() {
-				b = wrapBypassWithProtector(b)
-			}
-			tr.SetBypassConfig(b)
-		},
+		IP:             firstNonEmpty(cfg.TUNIPv4, "10.233.0.2"),
+		Inet4DNS:       firstNonEmpty(cfg.DNSv4, "10.233.0.1"),
+		IPv6:           cfg.TUNIPv6,
+		Inet6DNS:       cfg.DNSv6,
+		MTU:            firstPositive(cfg.TUNMTU, 1420),
+		Stack:          "gvisor",
+		FileDescriptor: tunFD,
 	}
-	t, err := tun.NewWithFD(tunCfg, tunFD)
+	t, err := tun.New(tunCfg)
 	if err != nil {
 		vm.cleanupOnFail()
-		return fmt.Errorf("tun.NewWithFD: %w", err)
+		return fmt.Errorf("tun.New: %w", err)
 	}
 	vm.tunInst = t
 	if err := eng.AddInbound(t.AsInbound("tun")); err != nil {

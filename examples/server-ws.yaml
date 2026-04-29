@@ -1,0 +1,89 @@
+# ════════════════════════════════════════════════════════════════════
+#  EWP v2 — Server (WebSocket over TLS, direct internet exposure)
+# ════════════════════════════════════════════════════════════════════
+#  This is the canonical "VPS exit node" deployment:
+#
+#    [users] --[wss + ECH + AEAD]--> :443 EWP server --[direct]--> 公网
+#
+#  Run: ewp -config server-ws.yaml
+#  Privileges: needs CAP_NET_BIND_SERVICE for :443 (or just run as root).
+#  Certificates: Let's Encrypt is the easiest path; example paths below.
+# ════════════════════════════════════════════════════════════════════
+
+# ──────────── Inbound: 接受客户端 EWP 连接 ────────────
+inbounds:
+  - tag: ewp-in                    # 任意标签,内部用于日志
+    type: ewpserver                # ewpserver | socks5 | http | tun
+    uuids:                         # 接受的 UUID 列表 — 即客户端身份
+      # 一个 UUID = 一个独立 client identity. 想限制并发就限 1 个,
+      # 想多用户就多列几个. 客户端配置里的 uuid 必须出现在这里.
+      - "01020304-0506-0708-090a-0b0c0d0e0f10"
+      # - "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+
+    transport:
+      kind: websocket              # 必须跟客户端匹配
+      url: "0.0.0.0:443"           # listen 地址 — :443 标准 HTTPS 端口
+      path: "/ewp"                 # 路径 — 客户端 url 必须以这个结尾
+
+      # TLS 证书 — Let's Encrypt 默认路径
+      cert: "/etc/letsencrypt/live/example.com/fullchain.pem"
+      key:  "/etc/letsencrypt/live/example.com/privkey.pem"
+
+      # 这些是给 client 端配置参考用的字段,server 端忽略:
+      # sni / host / ech / ech_domain → 不写
+
+# ──────────── Outbound: 客户端流量从这里出网 ────────────
+outbounds:
+  - tag: out
+    type: direct                   # direct = 用本机出网 (典型 exit 节点)
+                                   # 也可以 type: ewpclient 接下一跳 (中继)
+
+# ──────────── Router: 路由策略 ────────────
+router:
+  default: out                     # 必填:fallback outbound 的 tag
+
+# ──────────── DNS (server 端): 解析客户端要去的目标域名 ────────────
+dns:
+  server:
+    upstream:
+      servers:                     # DoH 上游 — 服务端解析远程目标用
+        - "https://1.1.1.1/dns-query"
+        - "https://dns.google/dns-query"
+        # cn 用户可加: "https://223.5.5.5/dns-query"
+      cache_size: 16384            # LRU 大小
+      worker_pool: 16              # 并发解析 goroutine 数
+      min_ttl_sec: 30              # cache 最短 TTL (太短毁缓存)
+      max_ttl_sec: 3600            # cache 最长 TTL (太长解析过期)
+
+# ──────────── STUN: 服务端启动时一次性 reflexive 探测 ────────────
+#  目的: 让客户端发 PROBE_REQ 时,能拿到本机真实公网 ip:port
+#  这是 EWP 内置 NAT 一致性检测的基石 (cmd/ewp -probe-nat 用得上)
+#  在 CDN 后面/直接公网/有 IPv6 都建议保留
+stun:
+  servers:
+    - "stun.cloudflare.com:3478"
+    - "stun.l.google.com:19302"
+    # cn 备选: "stun.miwifi.com:3478" / "stun.qq.com:3478"
+
+# ──────────── 不需要的字段 (server 端) ────────────
+#  client.doh          ← 客户端启动期 DoH (解析自己 server 域名 + 拉 ECH),
+#                       服务端无意义,写了也只是被忽略.
+#  v1 时代的 ech.bootstrap_doh / server_name_dns / dns.client.mode
+#  字段已删除;遗留 yaml 写了也不报错,但完全不再生效.
+
+# ════════════════════════════════════════════════════════════════════
+# 检查清单 (启动前)
+# ════════════════════════════════════════════════════════════════════
+#
+#  □ 域名 example.com 已经在 DNS 解析到本机 (A/AAAA)
+#  □ Let's Encrypt 证书已签发 (certbot certonly --nginx --dry-run)
+#  □ 防火墙放行 443 (ufw allow 443/tcp)
+#  □ uuid 已传给所有客户端
+#  □ 客户端 yaml 里 outbounds[].transport.url 设为 "wss://example.com/ewp"
+#
+# 部署后验证:
+#   curl -v https://example.com/ewp           # 应该是 400 (gws 升级失败)
+#                                             # 不应该是 timeout / 502
+#   ./ewp -config server-ws.yaml              # 启动,日志看 STUN reflexive
+#
+# ════════════════════════════════════════════════════════════════════

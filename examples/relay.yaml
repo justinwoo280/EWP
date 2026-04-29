@@ -28,6 +28,9 @@ outbounds:
 router:
   default: next-hop
 
-ech:
-  bootstrap_doh:
+# Used by the ewpclient outbound to reach exit.example.com:
+# resolves the domain via DoH and fetches the ECH HTTPS RR before
+# the first dial. One-shot; no background refresh.
+client:
+  doh:
     servers: ["https://1.1.1.1/dns-query"]

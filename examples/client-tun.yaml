@@ -4,25 +4,25 @@
 # flows preserve their remote src so STUN / WebRTC / Full-Cone
 # semantics are intact.
 #
-# Run as root (TUN device + route table + bypass dialer all need
-# CAP_NET_ADMIN). Stop with Ctrl-C; routes and TUN are torn down
-# automatically.
+# Run as root (TUN device + route table need CAP_NET_ADMIN).
+# Stop with Ctrl-C; routes and TUN are torn down automatically.
+#
+# No bypass-dialer plumbing: sing-tun's DefaultInterfaceMonitor
+# learns the physical egress NIC continuously and dialer Control
+# funcs always bind to the current default interface, so the
+# outbound's own connection never loops through our TUN.
 
 inbounds:
   - tag: tun-in
     type: tun
     tun:
       address: "10.233.0.2/24"
+      address_v6: "fd00:5ca1:e::2/64"   # optional, omit if you don't need v6
       dns:
         - "10.233.0.1"
         - "fd00:dead:beef::1"
       mtu: 1420
       fake_ip: true
-      # bypass_server is critical: without it the bypass dialer
-      # can't detect which physical interface to dial out on, and
-      # the outbound's TCP/UDP packets will loop back through the
-      # TUN. Should match the upstream EWP server (host or ip).
-      bypass_server: "example.com:443"
 
 outbounds:
   - tag: my-vps
@@ -37,8 +37,8 @@ outbounds:
 router:
   default: my-vps
 
-ech:
-  bootstrap_doh:
+client:
+  doh:
     servers:
       - "https://1.1.1.1/dns-query"
       - "https://dns.google/dns-query"

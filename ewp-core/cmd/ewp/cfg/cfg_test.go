@@ -7,9 +7,10 @@ import (
 	"testing"
 )
 
-// TestLoad_FullExample exercises every yaml field present in the
-// canonical examples/ tree, ensuring the schema parses without
-// surprises.
+// TestLoad_FullExample exercises the full v2 schema.  Since the DNS
+// surface area was deliberately simplified — there is no longer an
+// `ech.bootstrap_doh`, `server_name_dns`, or `dns.client` block —
+// only `client.doh.servers` covers all client-side bootstrap DNS.
 func TestLoad_FullExample(t *testing.T) {
 	yaml := `
 inbounds:
@@ -17,10 +18,10 @@ inbounds:
     type: tun
     tun:
       address: 198.18.0.1/24
+      address_v6: "fc00::1/64"
       mtu: 1500
       dns: ["198.18.0.2", "fc00::2"]
       fake_ip: true
-      bypass_server: vps.example.com:443
   - tag: socks
     type: socks5
     listen: "127.0.0.1:1080"
@@ -43,8 +44,6 @@ router:
   default: my-vps
 
 dns:
-  client:
-    mode: fake-ip
   server:
     upstream:
       servers: ["https://1.1.1.1/dns-query"]
@@ -53,8 +52,8 @@ dns:
       min_ttl_sec: 30
       max_ttl_sec: 1800
 
-ech:
-  bootstrap_doh:
+client:
+  doh:
     servers: ["https://1.1.1.1/dns-query"]
 
 stun:
@@ -74,20 +73,17 @@ stun:
 	if got := f.Router.Default; got != "my-vps" {
 		t.Errorf("router.default = %q, want my-vps", got)
 	}
-	if got := f.DNS.Client.Mode; got != "fake-ip" {
-		t.Errorf("dns.client.mode = %q", got)
-	}
 	if got := len(f.DNS.Server.Upstream.Servers); got != 1 {
 		t.Errorf("dns.server.upstream.servers = %d", got)
 	}
-	if got := len(f.ECH.BootstrapDoH.Servers); got != 1 {
-		t.Errorf("ech.bootstrap_doh.servers = %d", got)
+	if got := len(f.Client.DoH.Servers); got != 1 {
+		t.Errorf("client.doh.servers = %d", got)
 	}
 	if got := len(f.STUN.Servers); got != 1 {
 		t.Errorf("stun.servers = %d", got)
 	}
-	if got := f.Inbounds[0].TUN.BypassServer; got != "vps.example.com:443" {
-		t.Errorf("tun.bypass_server = %q", got)
+	if got := f.Inbounds[0].TUN.AddressV6; got != "fc00::1/64" {
+		t.Errorf("tun.address_v6 = %q", got)
 	}
 	if got := f.Inbounds[1].Users["alice"]; got != "s3cret" {
 		t.Errorf("socks5 user not parsed: %q", got)
@@ -193,10 +189,10 @@ func TestBuildAsyncResolver(t *testing.T) {
 	_ = r.Close()
 }
 
-// TestApplyClientDoHDefaults_AllEmpty: when no DoH is configured
-// anywhere, the built-in default (cn-mainland-friendly) fills both
-// ech.bootstrap_doh and server_name_dns.
-func TestApplyClientDoHDefaults_AllEmpty(t *testing.T) {
+// TestApplyClientDoHDefaults_Empty: a config that omits client.doh
+// gets DefaultClientDoH applied automatically. Callers don't need to
+// special-case "user didn't configure DoH".
+func TestApplyClientDoHDefaults_Empty(t *testing.T) {
 	cfg := writeTemp(t, "minimal.yaml", `
 inbounds:
   - tag: socks
@@ -210,18 +206,15 @@ outbounds:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !sameStrSlice(f.ECH.BootstrapDoH.Servers, DefaultClientDoH) {
-		t.Errorf("ech.bootstrap_doh.servers not defaulted: %v", f.ECH.BootstrapDoH.Servers)
-	}
-	if !sameStrSlice(f.ServerNameDNS.DoH.Servers, DefaultClientDoH) {
-		t.Errorf("server_name_dns.doh.servers not defaulted: %v", f.ServerNameDNS.DoH.Servers)
+	if !sameStrSlice(f.Client.DoH.Servers, DefaultClientDoH) {
+		t.Errorf("client.doh.servers not defaulted: %v", f.Client.DoH.Servers)
 	}
 }
 
-// TestApplyClientDoHDefaults_ClientUmbrella: f.Client.DoH.Servers
-// overrides the built-in default and propagates into the two leaves.
-func TestApplyClientDoHDefaults_ClientUmbrella(t *testing.T) {
-	cfg := writeTemp(t, "umbrella.yaml", `
+// TestApplyClientDoHDefaults_Explicit: an explicit list is preserved
+// and not overwritten by the default.
+func TestApplyClientDoHDefaults_Explicit(t *testing.T) {
+	cfg := writeTemp(t, "explicit.yaml", `
 inbounds:
   - tag: socks
     type: socks5
@@ -239,18 +232,17 @@ client:
 		t.Fatalf("Load: %v", err)
 	}
 	want := []string{"https://my-private-doh/dns-query"}
-	if !sameStrSlice(f.ECH.BootstrapDoH.Servers, want) {
-		t.Errorf("bootstrap not from umbrella: %v", f.ECH.BootstrapDoH.Servers)
-	}
-	if !sameStrSlice(f.ServerNameDNS.DoH.Servers, want) {
-		t.Errorf("server_name_dns not from umbrella: %v", f.ServerNameDNS.DoH.Servers)
+	if !sameStrSlice(f.Client.DoH.Servers, want) {
+		t.Errorf("client.doh.servers = %v, want %v", f.Client.DoH.Servers, want)
 	}
 }
 
-// TestApplyClientDoHDefaults_LeafOverridesUmbrella: an explicit leaf
-// block wins over both client.doh and DefaultClientDoH.
-func TestApplyClientDoHDefaults_LeafOverridesUmbrella(t *testing.T) {
-	cfg := writeTemp(t, "leaf.yaml", `
+// TestLoad_IgnoresLegacyFields: stale configs that still carry the
+// removed `ech.bootstrap_doh` / `server_name_dns` / `dns.client`
+// blocks must load without error — yaml unknown-key tolerance keeps
+// users' existing files working until they migrate.
+func TestLoad_IgnoresLegacyFields(t *testing.T) {
+	yaml := `
 inbounds:
   - tag: socks
     type: socks5
@@ -258,25 +250,19 @@ inbounds:
 outbounds:
   - tag: out
     type: direct
-client:
-  doh:
-    servers:
-      - "https://umbrella/dns-query"
 ech:
   bootstrap_doh:
-    servers:
-      - "https://only-for-ech/dns-query"
-`)
-	f, err := Load(cfg)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got := f.ECH.BootstrapDoH.Servers; len(got) != 1 || got[0] != "https://only-for-ech/dns-query" {
-		t.Errorf("ech leaf not preserved: %v", got)
-	}
-	// server_name_dns still falls back to umbrella because it was empty.
-	if got := f.ServerNameDNS.DoH.Servers; len(got) != 1 || got[0] != "https://umbrella/dns-query" {
-		t.Errorf("server_name_dns should default to umbrella: %v", got)
+    servers: ["https://legacy/dns-query"]
+server_name_dns:
+  doh:
+    servers: ["https://legacy2/dns-query"]
+dns:
+  client:
+    mode: fake-ip
+`
+	path := writeTemp(t, "legacy.yaml", yaml)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load: %v (legacy fields should be silently ignored)", err)
 	}
 }
 

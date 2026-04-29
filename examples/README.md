@@ -29,16 +29,22 @@ bundle by default; no system trust store dependency.
 
 ## ECH
 
-To enable ECH, point `ech: true` and ensure your server's domain has an
-HTTPS resource record advertising the ECH config. The bootstrap DoH (in the
-`ech.bootstrap_doh` block) fetches that record at startup.
+To enable ECH, set `ech: true` on the transport block and ensure your
+server's domain has an HTTPS resource record advertising the ECH config.
+The single `client.doh.servers` list is used at startup, exactly once,
+to (a) resolve the upstream server's domain and (b) fetch the ECH HTTPS
+RR. After bootstrap completes the client never touches DoH again.
 
-## TUN routing-loop guard
+For Cloudflare-fronted deployments add `ech_domain: cloudflare-ech.com`
+on the transport block — Cloudflare publishes ECH keys on a public domain
+that has no relation to your backend's URL.
 
-`client-tun.yaml` MUST set `inbounds[].bypass_server` to the upstream EWP
-server's host:port. Without it the bypass dialer cannot identify the
-physical outbound interface and the ewpclient outbound's own packets will
-loop back through the TUN — total connectivity loss.
+## TUN routing
+
+`client-tun.yaml` does not need any "bypass" hint. sing-tun's
+`DefaultInterfaceMonitor` watches kernel routing in real time and dialer
+Control funcs always bind to the current physical egress NIC, so the
+ewpclient outbound's own packets can never loop back through the TUN.
 
 ## NAT diagnostics
 
@@ -65,3 +71,8 @@ in v2 or have been replaced:
 - `xhttpMode: stream-down` — only `stream-one` is implemented (RPRX
   himself recommends against `stream-down`).
 - `tunnel-doh-server` — DNS no longer rides the tunnel as its own flow.
+- `ech.bootstrap_doh` / `server_name_dns` / `dns.client.mode` — collapsed
+  into the single `client.doh.servers` list. Old keys still load (yaml
+  unknown-key tolerance) but are ignored.
+- `inbounds[].tun.bypass_server` — sing-tun's interface monitor
+  obviates it; field removed from the schema. Old configs still load.

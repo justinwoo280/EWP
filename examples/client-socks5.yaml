@@ -22,22 +22,17 @@ outbounds:
 router:
   default: my-vps
 
-# Most users only need this one block — it's the umbrella default
-# that fans out to both ech.bootstrap_doh and server_name_dns when
-# those are not set explicitly. Omit entirely to fall back to the
-# built-in default (AliDNS 223.5.5.5 / 223.6.6.6 + Tencent doh.pub),
-# which works from networks that block 1.1.1.1.
+# client.doh.servers is the only client-side DoH knob. It is used
+# at startup, exactly once, to (a) resolve the upstream EWP server's
+# domain to an IP and (b) fetch the ECH HTTPS RR. After bootstrap
+# completes the client never touches DoH again — application DNS
+# traffic just rides the tunnel like any other UDP flow.
+#
+# Omit entirely to fall back to the built-in default (AliDNS
+# 223.5.5.5 / 223.6.6.6 + Tencent doh.pub), which works from
+# networks that block 1.1.1.1 / 8.8.8.8.
 client:
   doh:
     servers:
       - "https://1.1.1.1/dns-query"
       - "https://dns.google/dns-query"
-
-# --- power-user overrides (rarely needed) ---
-# ech:
-#   bootstrap_doh:
-#     servers: ["https://special-doh-only-for-ech/dns-query"]
-# server_name_dns:
-#   doh:
-#     servers: ["https://special-doh-only-for-server-name/dns-query"]
-#   prefer_ipv6: false

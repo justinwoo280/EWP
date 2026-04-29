@@ -17,81 +17,58 @@ import (
 )
 
 // File is the top-level config struct mapped from YAML/JSON.
+// File is the unified ech-workers engine config.
+//
+// The DNS surface area is intentionally minimal in v2:
+//
+//   - Client.DoH.Servers — the ONLY client-side DoH knob.  Used at
+//     startup to (a) resolve the upstream EWP server's domain to an
+//     IP and (b) fetch the ECH HTTPS RR.  After bootstrap completes
+//     the client never touches DoH again; everything else is data
+//     plane (apps' DNS queries either get FakeIP'd locally or are
+//     forwarded over the tunnel for the server to handle).
+//
+//   - DNS.Server.Upstream.Servers — the server-side DoH list used
+//     by the direct outbound to resolve DOMAIN targets the tunnel
+//     delivered.  Has nothing to do with the client.
+//
+// Older fields (ECH.BootstrapDoH, ServerNameDNS, DNS.Client) are no
+// longer recognised; their yaml/json keys are silently ignored to
+// keep stale configs from crashing.
 type File struct {
-	Inbounds      []InboundCfg     `yaml:"inbounds" json:"inbounds"`
-	Outbounds     []OutboundCfg    `yaml:"outbounds" json:"outbounds"`
-	Router        RouterCfg        `yaml:"router" json:"router"`
-	DNS           DNSCfg           `yaml:"dns" json:"dns"`
-	ECH           ECHCfg           `yaml:"ech" json:"ech"`
-	STUN          STUNCfg          `yaml:"stun" json:"stun"`
-	ServerNameDNS ServerNameDNSCfg `yaml:"server_name_dns" json:"server_name_dns"`
+	Inbounds  []InboundCfg  `yaml:"inbounds" json:"inbounds"`
+	Outbounds []OutboundCfg `yaml:"outbounds" json:"outbounds"`
+	Router    RouterCfg     `yaml:"router" json:"router"`
+	DNS       DNSCfg        `yaml:"dns" json:"dns"`
+	STUN      STUNCfg       `yaml:"stun" json:"stun"`
 
-	// Client groups settings that have client-side defaults applied
-	// to multiple downstream knobs. Specifically, Client.DoH.Servers
-	// is the fallback used to populate both ech.bootstrap_doh.servers
-	// and server_name_dns.doh.servers when those fields are empty.
-	// Most users only need to fill Client.DoH.Servers and let the
-	// rest default.
+	// Client.DoH.Servers is the single client-side DoH list. See
+	// File doc-comment for semantics.
 	Client ClientCfg `yaml:"client" json:"client"`
 }
 
-// ClientCfg holds defaults that fan out to several other blocks.
-//
-// The intent is to keep the config friendly for the common case
-// ("I just want my client-side DNS to all go through these DoH
-// servers") while still letting power users override individual
-// downstream blocks when they need to (e.g. fronting ECH bootstrap
-// DoH through a different provider than the one used for everyday
-// server-name lookups).
+// ClientCfg holds client-side bootstrap settings.
 type ClientCfg struct {
 	DoH UpstreamDoHCfg `yaml:"doh" json:"doh"`
 }
 
-// DefaultClientDoH is the fallback DoH list applied when neither
-// client.doh.servers, ech.bootstrap_doh.servers, nor
-// server_name_dns.doh.servers is configured. Picked for accessibility
-// from networks that block 1.1.1.1 / 8.8.8.8 (notably mainland China):
-// AliDNS + Tencent DNSPod, both of which have first-class DoH endpoints
-// and are reachable without prior tunneling.
+// DefaultClientDoH is the fallback DoH list applied when
+// client.doh.servers is not configured. Picked for accessibility from
+// networks that block 1.1.1.1 / 8.8.8.8 (notably mainland China):
+// AliDNS + Tencent DNSPod, both of which have first-class DoH
+// endpoints and are reachable without prior tunneling.
 var DefaultClientDoH = []string{
 	"https://223.5.5.5/dns-query",
 	"https://223.6.6.6/dns-query",
 	"https://doh.pub/dns-query",
 }
 
-// ServerNameDNSCfg configures how the client resolves the EWP server's
-// own domain name to an IP at Dial time. Distinct from `dns.client`
-// (TUN port-53 application traffic policy) and from `ech.bootstrap_doh`
-// (one-shot HTTPS RR fetch).
-//
-// Threat-model rationale: every Dial of a v2 transport currently leaks
-// the upstream server's domain to whoever the OS resolver talks to —
-// usually the local ISP, sometimes worse. Configuring server_name_dns.doh
-// routes that single A/AAAA query through DoH instead, so the wire only
-// carries `dns.google` or `1.1.1.1` traffic from the user's perspective.
-//
-// Empty doh.servers ⇒ OS resolver is used.
-type ServerNameDNSCfg struct {
-	DoH        UpstreamDoHCfg `yaml:"doh" json:"doh"`
-	PreferIPv6 bool           `yaml:"prefer_ipv6" json:"prefer_ipv6"`
-}
-
-// DNSCfg configures the project-wide DNS posture.
-//
-// The two upstream blocks (Client / Server) are independent because
-// in a relay deployment the client side and server side need
-// different policies — client typically wants fake-ip for the local
-// applications, while the server (which the client's traffic
-// eventually exits through) needs DoH for any inbound DOMAIN target.
+// DNSCfg holds server-side DNS configuration.  In v2 there is no
+// "client DNS policy" knob — application DNS traffic is just regular
+// UDP and gets handled the same way every other UDP flow does (TUN
+// FakeIP fast-path or forward to server).
 type DNSCfg struct {
-	Client ClientDNSCfg `yaml:"client" json:"client"`
 	Server ServerDNSCfg `yaml:"server" json:"server"`
-}
-
-// ClientDNSCfg controls how the local TUN inbound responds to port-53
-// queries from applications.
-type ClientDNSCfg struct {
-	Mode string `yaml:"mode" json:"mode"` // "fake-ip" (default) | "system"
 }
 
 // ServerDNSCfg controls how the server-side direct outbound resolves
@@ -107,12 +84,6 @@ type UpstreamDoHCfg struct {
 	WorkerPool int      `yaml:"worker_pool" json:"worker_pool"`
 	MinTTLSec  int      `yaml:"min_ttl_sec" json:"min_ttl_sec"`
 	MaxTTLSec  int      `yaml:"max_ttl_sec" json:"max_ttl_sec"`
-}
-
-// ECHCfg configures the bootstrap DoH used to fetch HTTPS RRs at
-// startup. Once we have an ECH config we never use OS DNS again.
-type ECHCfg struct {
-	BootstrapDoH UpstreamDoHCfg `yaml:"bootstrap_doh" json:"bootstrap_doh"`
 }
 
 // STUNCfg configures the optional reflexive-address discovery the
@@ -172,22 +143,18 @@ type TransportCfg struct {
 	KeyFile  string `yaml:"key" json:"key"`
 }
 
+// TUNCfg configures a TUN inbound.  bypass_server is a removed v1
+// field — sing-tun's DefaultInterfaceMonitor learns the physical
+// egress NIC continuously and dialer Control funcs always bind to
+// the current default interface, so no startup-time hint is needed.
+// yaml.v3 silently ignores unknown keys, so stale configs still load.
 type TUNCfg struct {
-	Name    string   `yaml:"name" json:"name"`
-	Address string   `yaml:"address" json:"address"`
-	MTU     int      `yaml:"mtu" json:"mtu"`
-	DNS     []string `yaml:"dns" json:"dns"`
-	FakeIP  bool     `yaml:"fake_ip" json:"fake_ip"`
-
-	// BypassServer is the host (or host:port) of the upstream EWP
-	// server. The TUN handler probes the routing table at startup
-	// (via UDP-connect to this host) to learn which physical
-	// interface to send proxy traffic out of, BEFORE it installs
-	// its own default route. Without this set, the TUN can route-
-	// loop: outbound traffic from the proxy itself gets pulled
-	// back into the TUN. STRONGLY recommended; emit a loud warning
-	// when missing.
-	BypassServer string `yaml:"bypass_server" json:"bypass_server"`
+	Name      string   `yaml:"name" json:"name"`
+	Address   string   `yaml:"address" json:"address"`       // IPv4 in CIDR, e.g. "10.233.0.2/24"
+	AddressV6 string   `yaml:"address_v6" json:"address_v6"` // IPv6 in CIDR, e.g. "fd00:5ca1:e::2/64"; optional
+	MTU       int      `yaml:"mtu" json:"mtu"`
+	DNS       []string `yaml:"dns" json:"dns"`               // [v4-dns, v6-dns]; both optional
+	FakeIP    bool     `yaml:"fake_ip" json:"fake_ip"`       // FakeIP DNS short-circuit (sub-ms reply)
 }
 
 // Load parses the file at path. Format is detected by extension.
@@ -228,26 +195,13 @@ func validate(f *File) error {
 	return nil
 }
 
-// applyClientDoHDefaults walks the three independent client-side DoH
-// blocks and fills any empty Servers list from a fallback chain:
-//
-//  1. f.Client.DoH.Servers (user-supplied umbrella default)
-//  2. DefaultClientDoH (built-in fallback — AliDNS + DNSPod, picked
-//     for cn-mainland reachability when 1.1.1.1 is blocked)
-//
-// Power users that want different DoH for different jobs simply set
-// the leaf block explicitly and the fallback never triggers for that
-// block.
+// applyClientDoHDefaults fills f.Client.DoH.Servers from the built-in
+// fallback list when the user did not set it. After this call the
+// rest of the codebase always reads f.Client.DoH.Servers and never
+// has to think about defaulting.
 func applyClientDoHDefaults(f *File) {
-	fallback := f.Client.DoH.Servers
-	if len(fallback) == 0 {
-		fallback = DefaultClientDoH
-	}
-	if len(f.ECH.BootstrapDoH.Servers) == 0 {
-		f.ECH.BootstrapDoH.Servers = fallback
-	}
-	if len(f.ServerNameDNS.DoH.Servers) == 0 {
-		f.ServerNameDNS.DoH.Servers = fallback
+	if len(f.Client.DoH.Servers) == 0 {
+		f.Client.DoH.Servers = DefaultClientDoH
 	}
 }
 
