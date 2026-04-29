@@ -184,6 +184,109 @@ func (h *Handler) HandleUDP(conn udpResponseWriter, payload []byte, src netip.Ad
 	sock.feedFromTUN(payload, src)
 }
 
+// handleTCPFromSing is invoked by singHandler.NewConnectionEx with a
+// freshly-accepted TCP conn from sing-tun.  We translate sing's
+// Socksaddr-style metadata into our own addr/port pair and reuse the
+// engine.HandleTCP path used previously by the gVisor forwarder.
+func (h *Handler) handleTCPFromSing(conn net.Conn, src, dst sockaddrLike) {
+	h.mu.RLock()
+	eng := h.engine
+	pool := h.fakeIP
+	h.mu.RUnlock()
+	if eng == nil {
+		_ = conn.Close()
+		return
+	}
+	srcEP := engine.Endpoint{Addr: src.AddrPort(), Port: src.Port()}
+	dstEP := makeDstEndpoint(dst.AddrPort(), pool)
+	defer conn.Close()
+	if err := eng.HandleTCP(h.ctx, srcEP, dstEP, conn); err != nil {
+		log.V("[TUN TCP] %s -> %s: %v", src.AddrPort(), dst.AddrPort(), err)
+	}
+}
+
+// handleUDPFromSing is invoked by singHandler.NewPacketConnectionEx with
+// a sing-tun-managed PacketConn for a single (src,dst) UDP flow.  We
+// reuse the engine.HandleUDP path and the per-(src,dst) tunSocket
+// bookkeeping.  FakeIP DNS short-circuit lives here too: if the dst
+// port is 53 and we have a pool, we answer the first query inline and
+// drop the rest.
+func (h *Handler) handleUDPFromSing(ctx context.Context, pc packetConnLike, src, dst sockaddrLike) {
+	h.mu.RLock()
+	eng := h.engine
+	pool := h.fakeIP
+	h.mu.RUnlock()
+	if eng == nil {
+		_ = pc.Close()
+		return
+	}
+
+	srcAddrPort := src.AddrPort()
+	dstAddrPort := dst.AddrPort()
+	srcEP := engine.Endpoint{Addr: srcAddrPort, Port: srcAddrPort.Port()}
+	dstEP := makeDstEndpoint(dstAddrPort, pool)
+
+	// Drain the PacketConn and demux into (1) FakeIP short-circuit or
+	// (2) per-(src,dst) tunSocket forwarded to the engine.
+	sock := newTunSocket(pcWriter{pc: pc}, srcAddrPort, dstAddrPort, dstEP, pool)
+	defer sock.Close()
+
+	go func() {
+		err := eng.HandleUDP(h.ctx, srcEP, dstEP, sock)
+		if err != nil && err != io.EOF {
+			log.V("[TUN UDP] %s -> %s: %v", srcAddrPort, dstAddrPort, err)
+		}
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		payload := buf[:n]
+
+		// FakeIP DNS short-circuit (sub-ms answer, no tunnel)
+		if pool != nil && dstAddrPort.Port() == 53 {
+			if domain := dns.ParseDNSName(payload); domain != "" {
+				v4 := pool.AllocateIPv4(domain)
+				v6 := pool.AllocateIPv6(domain)
+				if resp := dns.BuildDNSResponse(payload, v4, v6); resp != nil {
+					addr := &net.UDPAddr{IP: dstAddrPort.Addr().AsSlice(), Port: int(dstAddrPort.Port())}
+					_, _ = pc.WriteTo(resp, addr)
+					continue
+				}
+			}
+		}
+
+		sock.feedFromTUN(append([]byte(nil), payload...), srcAddrPort)
+	}
+}
+
+// sockaddrLike abstracts sing M.Socksaddr so the bridge in
+// sing_handler.go does not leak sing's metadata package into the rest
+// of the v2 codebase.
+type sockaddrLike interface {
+	AddrPort() netip.AddrPort
+	Port() uint16
+}
+
+// packetConnLike abstracts sing N.PacketConn for the same reason.
+type packetConnLike interface {
+	ReadFrom(p []byte) (n int, addr net.Addr, err error)
+	WriteTo(p []byte, addr net.Addr) (n int, err error)
+	Close() error
+}
+
+// pcWriter satisfies the udpResponseWriter interface required by
+// tunSocket while wrapping a sing-style PacketConn.
+type pcWriter struct{ pc packetConnLike }
+
+func (w pcWriter) WriteTo(payload []byte, addr net.Addr) (int, error) {
+	return w.pc.WriteTo(payload, addr)
+}
+func (w pcWriter) Close() error { return w.pc.Close() }
+
 // makeDstEndpoint converts a TUN-observed dst into an engine.Endpoint,
 // performing FakeIP reverse lookup so the outbound DNS policy applies.
 func makeDstEndpoint(dst netip.AddrPort, pool *dns.FakeIPPool) engine.Endpoint {
