@@ -89,12 +89,13 @@ func (t *TUN) InterfaceMonitor() tun.DefaultInterfaceMonitor { return t.monitor 
 // re-walking the kernel table.
 func (t *TUN) InterfaceFinder() control.InterfaceFinder { return t.interfaceFind }
 
-// New constructs a TUN device + stack but does NOT install routes
-// yet.  Call Start() to bring the device up and let sing-tun install
-// the routing table entries.
-func New(cfg *Config) (*TUN, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
+// buildTunOptions translates a v2 Config into the sing-tun Options
+// struct WITHOUT touching the OS (no /dev/net/tun, no netlink). It
+// is split out from New so unit tests can verify field propagation
+// (IPv4/IPv6 prefixes, DNS, MTU, AutoRoute) without root or a TUN
+// device. The non-OS-touching pieces (NetworkUpdateMonitor /
+// DefaultInterfaceMonitor / InterfaceFinder) are filled in by New.
+func buildTunOptions(cfg *Config) (tun.Options, error) {
 	mtu := uint32(cfg.MTU)
 	if mtu == 0 {
 		mtu = 1500
@@ -102,8 +103,7 @@ func New(cfg *Config) (*TUN, error) {
 
 	v4Prefix, err := parseCIDRWith(cfg.IP, "/24")
 	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("parse IPv4 address: %w", err)
+		return tun.Options{}, fmt.Errorf("parse IPv4 address: %w", err)
 	}
 	prefixes := []netip.Prefix{v4Prefix}
 
@@ -111,8 +111,7 @@ func New(cfg *Config) (*TUN, error) {
 	if cfg.IPv6 != "" {
 		v6Prefix, err := parseCIDRWith(cfg.IPv6, "/64")
 		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("parse IPv6 address: %w", err)
+			return tun.Options{}, fmt.Errorf("parse IPv6 address: %w", err)
 		}
 		v6Prefixes = []netip.Prefix{v6Prefix}
 	}
@@ -127,6 +126,38 @@ func New(cfg *Config) (*TUN, error) {
 		if a, err := netip.ParseAddr(cfg.Inet6DNS); err == nil {
 			dnsAddrs = append(dnsAddrs, a)
 		}
+	}
+
+	// AutoRoute is OFF when an external fd is supplied: in that
+	// scenario the OS (Android VpnService) already installed the
+	// routes, and asking sing-tun to do it again will fail with
+	// "operation not permitted" because the unprivileged app
+	// can't manipulate the kernel routing table directly.
+	autoRoute := cfg.FileDescriptor == 0
+
+	return tun.Options{
+		Name:           "ewp-tun",
+		Inet4Address:   prefixes,
+		Inet6Address:   v6Prefixes,
+		MTU:            mtu,
+		AutoRoute:      autoRoute,
+		StrictRoute:    false,
+		DNSServers:     dnsAddrs,
+		FileDescriptor: cfg.FileDescriptor,
+		Logger:         stubLogger{},
+	}, nil
+}
+
+// New constructs a TUN device + stack but does NOT install routes
+// yet.  Call Start() to bring the device up and let sing-tun install
+// the routing table entries.
+func New(cfg *Config) (*TUN, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	tunOpts, err := buildTunOptions(cfg)
+	if err != nil {
+		cancel()
+		return nil, err
 	}
 
 	// FakeIP pool is always installed in v2 (sub-ms DNS, no tunnel
@@ -156,25 +187,10 @@ func New(cfg *Config) (*TUN, error) {
 	}
 	finder := control.NewDefaultInterfaceFinder()
 
-	// AutoRoute is OFF when an external fd is supplied: in that
-	// scenario the OS (Android VpnService) already installed the
-	// routes, and asking sing-tun to do it again will fail with
-	// "operation not permitted" because the unprivileged app
-	// can't manipulate the kernel routing table directly.
-	autoRoute := cfg.FileDescriptor == 0
-	tunOpts := tun.Options{
-		Name:             "ewp-tun",
-		Inet4Address:     prefixes,
-		Inet6Address:     v6Prefixes,
-		MTU:              mtu,
-		AutoRoute:        autoRoute,
-		StrictRoute:      false,
-		DNSServers:       dnsAddrs,
-		FileDescriptor:   cfg.FileDescriptor,
-		InterfaceFinder:  finder,
-		InterfaceMonitor: ifaceMon,
-		Logger:           stubLogger{},
-	}
+	// Wire the OS-touching fields that buildTunOptions intentionally
+	// left blank.
+	tunOpts.InterfaceFinder = finder
+	tunOpts.InterfaceMonitor = ifaceMon
 
 	dev, err := tun.New(tunOpts)
 	if err != nil {
