@@ -179,13 +179,19 @@ func New(cfg *Config) (*TUN, error) {
 		cancel()
 		return nil, fmt.Errorf("create network monitor: %w", err)
 	}
-	ifaceMon, err := tun.NewDefaultInterfaceMonitor(netMon, stubLogger{}, tun.DefaultInterfaceMonitorOptions{})
+	finder := control.NewDefaultInterfaceFinder()
+	// The InterfaceFinder MUST be supplied via options here — sing-tun's
+	// monitor.Start() immediately calls interfaceFinder.Update() with no
+	// nil guard.  Forgetting it crashes the process on TUN start with a
+	// nil pointer deref deep inside monitor_shared.go.
+	ifaceMon, err := tun.NewDefaultInterfaceMonitor(netMon, stubLogger{}, tun.DefaultInterfaceMonitorOptions{
+		InterfaceFinder: finder,
+	})
 	if err != nil {
 		_ = netMon.Close()
 		cancel()
 		return nil, fmt.Errorf("create interface monitor: %w", err)
 	}
-	finder := control.NewDefaultInterfaceFinder()
 
 	// Wire the OS-touching fields that buildTunOptions intentionally
 	// left blank.

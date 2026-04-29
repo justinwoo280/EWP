@@ -3,7 +3,48 @@ package tun
 import (
 	"net/netip"
 	"testing"
+
+	singtun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing/common/control"
 )
+
+// TestInterfaceMonitor_StartsWithoutNilDeref pins down a regression
+// from the early sing-tun migration: NewDefaultInterfaceMonitor was
+// being called with an empty options struct, leaving InterfaceFinder
+// nil.  monitor.Start() then immediately invoked
+// interfaceFinder.Update() with no nil guard, panicking the entire
+// process the first time a TUN client started.
+//
+// We construct the monitor exactly the way New() does and call
+// Start() — if any required option is missing the panic surfaces
+// here instead of in production.
+func TestInterfaceMonitor_StartsWithoutNilDeref(t *testing.T) {
+	netMon, err := singtun.NewNetworkUpdateMonitor(stubLogger{})
+	if err != nil {
+		t.Fatalf("NewNetworkUpdateMonitor: %v", err)
+	}
+	defer netMon.Close()
+
+	finder := control.NewDefaultInterfaceFinder()
+	mon, err := singtun.NewDefaultInterfaceMonitor(netMon, stubLogger{}, singtun.DefaultInterfaceMonitorOptions{
+		InterfaceFinder: finder,
+	})
+	if err != nil {
+		t.Fatalf("NewDefaultInterfaceMonitor: %v", err)
+	}
+	defer mon.Close()
+
+	if err := netMon.Start(); err != nil {
+		t.Fatalf("netMon.Start: %v", err)
+	}
+	// Must not panic. The actual Update() call against the kernel
+	// may legitimately fail in some sandboxes (e.g. no netlink
+	// access), but the logger.Error() path requires the logger
+	// itself to be non-nil — which is what the original bug was.
+	if err := mon.Start(); err != nil {
+		t.Fatalf("mon.Start: %v", err)
+	}
+}
 
 // TestBuildTunOptions_IPv4Only locks in the baseline: a config with
 // only an IPv4 address yields an Options with one v4 prefix, no v6
