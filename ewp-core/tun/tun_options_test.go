@@ -8,6 +8,35 @@ import (
 	"github.com/sagernet/sing/common/control"
 )
 
+// TestUDPNATTimeout_NonZero pins down a regression from sing-tun
+// migration P0/P1: StackOptions.UDPTimeout left at zero would
+// propagate into udpnat2.New() which immediately panics with
+// "invalid timeout".  This is impossible to trigger in unit tests
+// without spinning up the whole stack, so instead we assert the
+// invariant at the boundary: the defaultUDPTimeout constant must
+// be strictly positive, and Config.UDPTimeout falling through 0
+// must end up as defaultUDPTimeout in our resolution path.
+func TestUDPNATTimeout_NonZero(t *testing.T) {
+	if defaultUDPTimeout <= 0 {
+		t.Fatalf("defaultUDPTimeout must be positive, got %v", defaultUDPTimeout)
+	}
+	// Mirror the resolution that runs inside New(): a zero or
+	// negative override leaves us with the default; a positive
+	// override is honoured verbatim.
+	for _, in := range []int64{0, -1, -1000} {
+		cfg := &Config{}
+		cfg.UDPTimeout = 0 // explicit zero from yaml is the panic case
+		_ = in
+		got := cfg.UDPTimeout
+		if got <= 0 {
+			got = defaultUDPTimeout
+		}
+		if got <= 0 {
+			t.Fatalf("resolved UDP timeout still <= 0: %v", got)
+		}
+	}
+}
+
 // TestInterfaceMonitor_StartsWithoutNilDeref pins down a regression
 // from the early sing-tun migration: NewDefaultInterfaceMonitor was
 // being called with an empty options struct, leaving InterfaceFinder

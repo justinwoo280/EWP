@@ -5,6 +5,7 @@ package cfg
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"ewp-core/engine"
 	"ewp-core/tun"
@@ -43,6 +44,9 @@ func buildTUNInbound(c InboundCfg) (engine.Inbound, error) {
 		Inet6DNS: dnsv6,
 		MTU:      mtu,
 		Stack:    "system",
+	}
+	if c.TUN.UDPTimeoutSec > 0 {
+		tcfg.UDPTimeout = time.Duration(c.TUN.UDPTimeoutSec) * time.Second
 	}
 	t, err := tun.New(tcfg)
 	if err != nil {

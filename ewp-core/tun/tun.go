@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
@@ -56,7 +57,22 @@ type Config struct {
 	// sing-tun skips device creation AND OS routing setup (the
 	// Android system handles routing via VpnService.Builder).
 	FileDescriptor int
+
+	// UDPTimeout is the lifetime of an idle UDP NAT entry inside
+	// the sing-tun stack.  Zero falls back to defaultUDPTimeout
+	// (5 minutes) which matches sing-box's chosen default and is a
+	// safe fit for typical conntrack configurations.  sing-tun's
+	// udpnat2.New panics with "invalid timeout" if it ever receives
+	// zero, so this field MUST end up non-zero by the time we hand
+	// StackOptions to NewStack().
+	UDPTimeout time.Duration
 }
+
+// defaultUDPTimeout matches sing-box's chosen default; conservative
+// enough that long-lived UDP flows (DTLS sessions, QUIC, WebRTC
+// media) survive normal application idle periods, but short enough
+// that the NAT table does not grow without bound on busy nodes.
+const defaultUDPTimeout = 5 * time.Minute
 
 // TUN is the v2 inbound device.  Created by New(); started by Start().
 type TUN struct {
@@ -210,6 +226,10 @@ func New(cfg *Config) (*TUN, error) {
 	if stackName == "" {
 		stackName = "system"
 	}
+	udpTimeout := cfg.UDPTimeout
+	if udpTimeout <= 0 {
+		udpTimeout = defaultUDPTimeout
+	}
 	st, err := tun.NewStack(stackName, tun.StackOptions{
 		Context:                ctx,
 		Tun:                    dev,
@@ -219,6 +239,9 @@ func New(cfg *Config) (*TUN, error) {
 		ForwarderBindInterface: true,
 		IncludeAllNetworks:     false,
 		InterfaceFinder:        finder,
+		// UDPTimeout MUST be non-zero — sing-tun's stack_system.go
+		// passes it straight into udpnat2.New() which panics on 0.
+		UDPTimeout: udpTimeout,
 	})
 	if err != nil {
 		_ = dev.Close()

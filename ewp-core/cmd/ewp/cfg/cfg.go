@@ -155,6 +155,13 @@ type TUNCfg struct {
 	MTU       int      `yaml:"mtu" json:"mtu"`
 	DNS       []string `yaml:"dns" json:"dns"`               // [v4-dns, v6-dns]; both optional
 	FakeIP    bool     `yaml:"fake_ip" json:"fake_ip"`       // FakeIP DNS short-circuit (sub-ms reply)
+
+	// UDPTimeoutSec overrides sing-tun's UDP NAT entry lifetime
+	// (default 300 seconds = 5 minutes).  Lower values free NAT
+	// table memory faster on busy nodes; higher values let
+	// long-lived UDP flows (DTLS, QUIC, WebRTC) survive idle gaps.
+	// Zero or negative leaves the default in place.
+	UDPTimeoutSec int `yaml:"udp_timeout_sec,omitempty" json:"udp_timeout_sec,omitempty"`
 }
 
 // Load parses the file at path. Format is detected by extension.
