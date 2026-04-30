@@ -69,29 +69,33 @@ type Config struct {
 }
 
 // defaultUDPTimeout deliberately undercuts sing-box's 5-minute
-// default and instead pins the value to RFC 4787 §4.3's recommended
-// minimum (30 seconds).  The longer a UDP NAT entry survives, the
-// longer-lived the side-channels become:
+// default and pins itself to the RFC 4787 REQ-5 floor of two
+// minutes.  The longer a UDP NAT entry survives, the longer-lived
+// the side-channels become:
 //
 //   * On a colocated host, an observer can count outstanding UDP
 //     mappings (ss -uapn | wc -l) to recover a smoothed history of
 //     the user's recent UDP destinations — five minutes of history
-//     vs thirty seconds is a meaningful privacy delta.
+//     vs two minutes is a meaningful privacy delta.
 //   * In a full-cone NAT deployment the source port stays "callable"
-//     by any third party for the duration of the mapping.  Five
-//     minutes is a 10x larger reverse-attack window than 30s.
+//     by any third party for the duration of the mapping; cutting
+//     the window in half cuts the reverse-attack surface accordingly.
 //   * sing-tun (and most user-space TUN stacks) do not implement
 //     the protocol-aware UDP state machine that the Linux kernel's
 //     nf_conntrack provides — DNS, NTP, STUN one-shots all stay in
 //     the table for the same duration as a video call's RTP flow.
 //     Lacking that selectivity, the only safe default is the floor.
 //
-// Real long-lived UDP flows (DTLS-VPN, SIP, persistent QUIC) keep
-// the entry alive simply by exchanging packets, so the lower default
-// only affects strictly idle mappings.  Operators with workloads that
-// genuinely need longer mappings can opt in via tun.udp_timeout_sec
-// in yaml — the escape hatch is one line, the safe default is global.
-const defaultUDPTimeout = 30 * time.Second
+// Going below 120s is tempting but breaks RFC-compliant peers:
+// SIP/VoIP keep-alive cadences (RFC 5626), WebRTC ICE consent
+// freshness, and some DTLS-VPN reconnect windows all assume that
+// the NAT mapping survives ≥2 minutes of partial silence.  120s
+// is the tightest value that does not strand them.
+//
+// Operators with workloads that genuinely need longer mappings can
+// opt in via tun.udp_timeout_sec in yaml — the escape hatch is one
+// line, the safe default is global.
+const defaultUDPTimeout = 2 * time.Minute
 
 // TUN is the v2 inbound device.  Created by New(); started by Start().
 type TUN struct {

@@ -9,17 +9,23 @@ import (
 	"github.com/sagernet/sing/common/control"
 )
 
-// TestUDPNATTimeout_DefaultIsRFCFloor asserts that we never silently
-// raise the default UDP NAT timeout above the RFC 4787 floor without
-// also revisiting the privacy reasoning — see defaultUDPTimeout's
-// comment in tun.go.  A future refactor that bumps it back up to
-// sing-box's 5-minute value should fail this test on the way in.
-func TestUDPNATTimeout_DefaultIsRFCFloor(t *testing.T) {
-	const rfc4787Floor = 30 * time.Second
-	if defaultUDPTimeout > rfc4787Floor {
-		t.Fatalf("defaultUDPTimeout = %v exceeds RFC 4787 floor %v; "+
-			"see tun.go comment for the privacy rationale before raising",
-			defaultUDPTimeout, rfc4787Floor)
+// TestUDPNATTimeout_DefaultMatchesRFCFloor pins the default at the
+// RFC 4787 REQ-5 floor (2 minutes).  Two separate failure modes
+// matter here:
+//
+//   * Bumping the value above 2 minutes silently re-widens the
+//     side-channels documented in defaultUDPTimeout's comment.
+//   * Dropping below 2 minutes breaks RFC-compliant SIP/WebRTC/DTLS
+//     peers that assume the floor is honoured.
+//
+// Either direction is a deliberate design change that needs to
+// land alongside an updated rationale, not as a drive-by tweak.
+func TestUDPNATTimeout_DefaultMatchesRFCFloor(t *testing.T) {
+	const rfc4787REQ5Floor = 2 * time.Minute
+	if defaultUDPTimeout != rfc4787REQ5Floor {
+		t.Fatalf("defaultUDPTimeout = %v, want %v (RFC 4787 REQ-5 floor); "+
+			"see tun.go comment before changing in either direction",
+			defaultUDPTimeout, rfc4787REQ5Floor)
 	}
 }
 
