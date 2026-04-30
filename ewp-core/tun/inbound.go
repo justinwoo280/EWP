@@ -33,6 +33,12 @@ type tunInbound struct {
 	tag string
 }
 
+// TUN exposes the wrapped *TUN to callers that need late-binding
+// access to the device after AddInbound has run (e.g. cmd/ewp wires
+// the bypass dialer into clientResolver only after TUN.Start has
+// observed a default interface).
+func (i *tunInbound) TUN() *TUN { return i.tun }
+
 func (i *tunInbound) Tag() string { return i.tag }
 
 func (i *tunInbound) Start(ctx context.Context, h engine.InboundHandler) error {

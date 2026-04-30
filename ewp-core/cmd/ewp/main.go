@@ -23,6 +23,7 @@ import (
 	"ewp-core/inbound/ewpserver"
 	"ewp-core/log"
 	"ewp-core/outbound/direct"
+	"ewp-core/tun"
 )
 
 // hasAnyEWPServerInbound reports whether any inbound is an ewpserver
@@ -150,6 +151,25 @@ func main() {
 		if err := eng.AddInbound(in); err != nil {
 			fmt.Fprintf(os.Stderr, "AddInbound %q: %v\n", ic.Tag, err)
 			os.Exit(2)
+		}
+		// CRITICAL: once the TUN inbound starts and steals the
+		// system default route, every subsequent TCP dial from a
+		// non-bypass-aware caller (notably the client.doh resolver
+		// used to translate the upstream EWP server's hostname into
+		// an IP) gets captured by the TUN device and either loops
+		// forever or times out silently.  sing-tun's monitor knows
+		// which physical NIC was the default *before* it took over,
+		// so we wrap that into a *net.Dialer.Control function and
+		// push it into clientResolver. Without this hook the symptom
+		// is "ECH config bootstrap succeeds but the actual dial
+		// to the EWP server never happens" — exactly because ECH
+		// runs synchronously *before* TUN.Start, while server-name
+		// resolution runs *after*.
+		if ti, ok := in.(interface{ TUN() *tun.TUN }); ok && clientResolver != nil {
+			if d := tun.MakeBypassDialer(ti.TUN()); d != nil {
+				clientResolver.SetDialer(d)
+				log.Printf("[ewp] inbound %q: bypass dialer wired into clientResolver", ic.Tag)
+			}
 		}
 	}
 
