@@ -3,10 +3,25 @@ package tun
 import (
 	"net/netip"
 	"testing"
+	"time"
 
 	singtun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
 )
+
+// TestUDPNATTimeout_DefaultIsRFCFloor asserts that we never silently
+// raise the default UDP NAT timeout above the RFC 4787 floor without
+// also revisiting the privacy reasoning — see defaultUDPTimeout's
+// comment in tun.go.  A future refactor that bumps it back up to
+// sing-box's 5-minute value should fail this test on the way in.
+func TestUDPNATTimeout_DefaultIsRFCFloor(t *testing.T) {
+	const rfc4787Floor = 30 * time.Second
+	if defaultUDPTimeout > rfc4787Floor {
+		t.Fatalf("defaultUDPTimeout = %v exceeds RFC 4787 floor %v; "+
+			"see tun.go comment for the privacy rationale before raising",
+			defaultUDPTimeout, rfc4787Floor)
+	}
+}
 
 // TestUDPNATTimeout_NonZero pins down a regression from sing-tun
 // migration P0/P1: StackOptions.UDPTimeout left at zero would
