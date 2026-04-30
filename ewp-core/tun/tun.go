@@ -290,6 +290,26 @@ func New(cfg *Config) (*TUN, error) {
 
 // Start brings the TUN device online and installs OS routing rules.
 // Blocks until ctx (passed at New) is cancelled.
+//
+// CRITICAL ordering note (gotcha that wasted hours during the
+// initial sing-tun migration): on every OS, t.device.Start() is the
+// call that performs the OS-level integration steps:
+//
+//   - On Windows:  RegisterMyInterface, addRouteList (installs the
+//     8 sub-range default-route covering 0.0.0.0/0), and the DNS
+//     resolver cache flush.  WITHOUT THIS, the wintun adapter is
+//     visible and even has an IP assigned, but no default route ->
+//     Windows NLA marks it "unidentified" and steers application
+//     traffic to the physical NIC.  The TUN side then only sees
+//     uninteresting multicast (SSDP, mDNS) and no user traffic
+//     ever reaches the stack.
+//   - On Darwin:   utun bring-up + route install via PF_ROUTE.
+//   - On Linux:    netlink RTM_SETLINK up + RTM_NEWROUTE.
+//
+// Order must match sing-box's reference implementation
+// (protocol/tun/inbound.go: stack.Start(), then tunIf.Start()) —
+// the stack registers its packet processors first, then the device
+// brings the interface fully online so user traffic starts flowing.
 func (t *TUN) Start() error {
 	if err := t.networkMon.Start(); err != nil {
 		return fmt.Errorf("start network monitor: %w", err)
@@ -299,6 +319,9 @@ func (t *TUN) Start() error {
 	}
 	if err := t.stack.Start(); err != nil {
 		return fmt.Errorf("start stack: %w", err)
+	}
+	if err := t.device.Start(); err != nil {
+		return fmt.Errorf("start tun device: %w", err)
 	}
 	log.Printf("[TUN] started: stack=%s ipv4=%s ipv6=%s mtu=%d",
 		stackName(t.config.Stack), t.config.IP, t.config.IPv6, t.MTU())
